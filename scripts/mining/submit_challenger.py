@@ -77,6 +77,20 @@ def main():
                   v["best"]["mu_hat"], v["best"]["lcb"], v["best"]["delta"])
         sys.exit(3)
 
+    eval_mode = v["best"].get("eval_mode", "unknown")
+    if eval_mode == "local":
+        log.error(
+            "verdict used eval_mode=local (mining-pool holdout). That is NOT comparable "
+            "to validator/eval_server — re-run train_challenger with "
+            "--eval-mode validator --sim-hotkey <your-hotkey> and submit only if that passes."
+        )
+        sys.exit(4)
+    if eval_mode != "validator":
+        log.warning(
+            "verdict eval_mode=%r (expected 'validator'); offline gate may not match on-chain",
+            eval_mode,
+        )
+
     wallet = bt.Wallet(name=args.wallet_name, hotkey=args.hotkey)
     log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
 
@@ -123,9 +137,10 @@ def main():
     )
     if resp.success:
         log.info("reveal committed: %s -- validator should pick up after reveal", resp.message)
-    else:
-        log.error("commitment failed: %s", resp.message)
-        sys.exit(5)
+        log.info("done — safe to exit (validator eval runs separately on the network)")
+        sys.exit(0)
+    log.error("commitment failed: %s", resp.message)
+    sys.exit(5)
 
 
 if __name__ == "__main__":

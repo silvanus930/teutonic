@@ -115,6 +115,8 @@ def load_raw_sequences(
 
     for item in ordered[: cfg.max_files_per_eval]:
         key = item["key"]
+        log.info("raw holdout: parquet %d/%d %s",
+                 len(used_files) + 1, min(cfg.max_files_per_eval, len(ordered)), key)
         local_path = _download_parquet(r2, cfg, key)
         used_files.append(key)
         for text in _iter_parquet_texts(local_path, cfg.text_column):
@@ -127,7 +129,10 @@ def load_raw_sequences(
                 sequences.append(token_remainder[:seq_len])
                 token_remainder = token_remainder[seq_len:]
                 if len(sequences) >= eval_n:
+                    log.info("raw holdout: reached %d/%d sequences", len(sequences), eval_n)
                     return sequences, _meta(cfg, files, used_files, docs_seen)
+                if len(sequences) % 500 == 0:
+                    log.info("raw holdout: tokenized %d/%d sequences", len(sequences), eval_n)
 
     if not sequences:
         raise RuntimeError(
