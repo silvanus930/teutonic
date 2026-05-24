@@ -223,6 +223,31 @@ def hippius_download(key: str, dest: Path) -> Path:
     return dest
 
 
+def global_sample_shard_indices(
+    shards: list[np.ndarray],
+    n: int,
+    rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    """Pick n random (shard_idx, row_idx) pairs uniformly across all shards."""
+    active = [(i, s) for i, s in enumerate(shards) if len(s) > 0]
+    if not active:
+        return []
+    sizes = [len(s) for _, s in active]
+    total = sum(sizes)
+    n = min(n, total)
+    gindices = rng.choice(total, size=n, replace=False)
+    cumsum = np.zeros(len(sizes) + 1, dtype=np.int64)
+    for i, sz in enumerate(sizes):
+        cumsum[i + 1] = cumsum[i] + sz
+    out: list[tuple[int, int]] = []
+    for gi in gindices:
+        fi = int(np.searchsorted(cumsum, gi, side="right") - 1)
+        local = int(gi - cumsum[fi])
+        shard_idx, _ = active[fi]
+        out.append((shard_idx, local))
+    return out
+
+
 def load_raw_sequences(
     n_sequences: int,
     seq_len: int,
@@ -232,9 +257,9 @@ def load_raw_sequences(
     max_files: int = RAW_MAX_FILES,
     model_vocab_size: int | None = None,
 ) -> np.ndarray:
-    """Tokenize FineWeb-Edu parquet from Hippius (matches production eval path)."""
+    """Tokenize FineWeb-Edu parquet into cache, then global-random sample windows."""
     import urllib.request
-    from eval.raw_dataset import _iter_parquet_texts
+    from eval.raw_dataset import RawDatasetConfig, _get_tokenized_npy, sample_global_from_token_mmaps
 
     manifest_url = f"{HIPPIUS_BASE}/{RAW_MANIFEST_KEY}"
     log.info("fetching raw dataset manifest %s", manifest_url)
@@ -248,53 +273,75 @@ def load_raw_sequences(
     if not files:
         raise RuntimeError(f"no parquet files in raw manifest {RAW_MANIFEST_KEY}")
 
-    seed = int.from_bytes(hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little")
-    rng = np.random.Generator(np.random.PCG64(seed))
-    start = int(rng.integers(0, len(files)))
-    ordered = files[start:] + files[:start]
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_repo, token=os.environ.get("HF_TOKEN") or None, use_fast=True,
-    )
-    eos_id = tokenizer.eos_token_id
-    if eos_id is None:
-        eos_id = tokenizer.sep_token_id
-
-    sequences: list[list[int]] = []
-    remainder: list[int] = []
     raw_cache = cache / "raw_parquet"
     raw_cache.mkdir(parents=True, exist_ok=True)
-    used_files = 0
+    token_cache = cache / "raw_tokens"
+    token_cache.mkdir(parents=True, exist_ok=True)
 
-    for key in ordered[:max_files]:
-        used_files += 1
-        digest = hashlib.sha256(key.encode()).hexdigest()[:24]
-        local = hippius_download(key, raw_cache / f"{digest}.parquet")
-        for text in _iter_parquet_texts(local, os.environ.get("TEUTONIC_RAW_TEXT_COLUMN", "text")):
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if eos_id is not None:
-                ids.append(int(eos_id))
-            remainder.extend(ids)
-            while len(remainder) >= seq_len:
-                sequences.append(remainder[:seq_len])
-                remainder = remainder[seq_len:]
-                if len(sequences) >= n_sequences:
-                    arr = np.asarray(sequences[:n_sequences], dtype=np.uint32)
-                    # Use model embedding table size, not tokenizer.vocab_size:
-                    # Qwen3 reports 151643 base tokens but config.vocab_size is
-                    # 151936 (room for special ids like eos 151645).
-                    validate_sequences_vocab(arr, model_vocab_size, "raw")
-                    log.info(
-                        "raw dataset: %d sequences from %d parquet file(s), max_id=%d",
-                        len(arr), used_files, int(arr.max()),
-                    )
-                    return arr
-
-    raise RuntimeError(
-        f"raw dataset produced only {len(sequences)}/{n_sequences} sequences "
-        f"from {min(max_files, len(ordered))} parquet files; increase "
-        "TEUTONIC_RAW_MAX_FILES_PER_EVAL or --raw-max-files"
+    cfg = RawDatasetConfig(
+        manifest_key=RAW_MANIFEST_KEY,
+        prefix=os.environ.get("TEUTONIC_RAW_DATASET_PREFIX", "hf-mirrors/HuggingFaceFW/fineweb-edu/data").strip("/"),
+        explicit_keys=tuple(),
+        tokenizer_repo=tokenizer_repo,
+        text_column=os.environ.get("TEUTONIC_RAW_TEXT_COLUMN", "text"),
+        cache_dir=token_cache,
+        max_files_per_eval=max_files,
+        list_fallback=False,
     )
+
+    class _HttpR2:
+        ds_bucket = "hippius"
+        ds_client = None
+
+        def ds_get(self, _key: str):
+            return None
+
+    r2 = _HttpR2()
+    orig_download = None
+    try:
+        from eval import raw_dataset as _raw_mod
+        orig_download = _raw_mod._download_parquet
+
+        def _http_download(_r2, _cfg, key: str) -> Path:
+            digest = hashlib.sha256(key.encode()).hexdigest()[:24]
+            return hippius_download(key, raw_cache / f"{digest}.parquet")
+
+        _raw_mod._download_parquet = _http_download
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_repo, token=os.environ.get("HF_TOKEN") or None, use_fast=True,
+        )
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            eos_id = tokenizer.sep_token_id
+
+        npy_files = sorted(token_cache.glob("*.tokens.npy"))
+        if len(npy_files) < max_files:
+            seed = int.from_bytes(
+                hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little",
+            )
+            rng = np.random.Generator(np.random.PCG64(seed))
+            start = int(rng.integers(0, len(files)))
+            ordered = files[start:] + files[:start]
+            for key in ordered[:max_files]:
+                _get_tokenized_npy(r2, cfg, key, tokenizer, eos_id)
+            npy_files = sorted(token_cache.glob("*.tokens.npy"))
+
+        windows, meta = sample_global_from_token_mmaps(
+            npy_files, n_sequences, seq_len, seed_str,
+        )
+    finally:
+        if orig_download is not None:
+            from eval import raw_dataset as _raw_mod
+            _raw_mod._download_parquet = orig_download
+
+    arr = np.asarray(windows, dtype=np.uint32)
+    validate_sequences_vocab(arr, model_vocab_size, "raw")
+    log.info(
+        "raw dataset (global): %d sequences from %d token cache shard(s), max_id=%d meta=%s",
+        len(arr), meta.get("total_shards", len(npy_files)), int(arr.max()), meta.get("mode"),
+    )
+    return arr
 
 
 def resolve_dataset_mode(requested: str, manifest: dict, king_dir: Path) -> str:
@@ -498,18 +545,11 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
                      seed: int, device: str, work: Path) -> tuple[Path, Path]:
     """Score `n_score` random samples on the king, bucket, write train/val jsonl."""
     rng = np.random.default_rng(seed)
-    cands = []
-    for s_idx, shard in enumerate(shards):
-        if len(shard) == 0:
-            continue
-        n_take = max(n_score // len(shards), 32)
-        idxs = rng.choice(len(shard), size=min(n_take, len(shard)), replace=False)
-        for j in idxs:
-            cands.append((s_idx, int(j)))
+    cands = global_sample_shard_indices(shards, n_score, rng)
     rng.shuffle(cands)
 
     log.info(
-        "scoring: %d candidates from %d shard(s), seed=%d, king=%s, device=%s",
+        "scoring: %d candidates (global sample across %d shard(s)), seed=%d, king=%s, device=%s",
         len(cands), len(shards), seed, king_dir, device,
     )
     t_score = time.time()
@@ -811,8 +851,8 @@ def main():
                     help="Working dir on this box")
     ap.add_argument("--bundle", default="/root/teutonic-mining/bundle",
                     help="Path to training_bundle directory")
-    ap.add_argument("--n-shards", type=int, default=2,
-                    help="Number of dataset shards to download for training")
+    ap.add_argument("--n-shards", type=int, default=0,
+                    help="Training shards to load (0 = all manifest shards except --eval-shard)")
     ap.add_argument("--shard-start", type=int, default=0,
                     help="Index of first shard to use (other than eval shard)")
     ap.add_argument("--dataset-mode", choices=("auto", "pretokenized", "raw"), default="auto",
@@ -820,8 +860,8 @@ def main():
                          "(production eval path); pretokenized: v2 .npy shards; raw: force FineWeb")
     ap.add_argument("--raw-max-files", type=int, default=RAW_MAX_FILES,
                     help="Max FineWeb parquet files to scan when --dataset-mode raw")
-    ap.add_argument("--eval-shard", type=int, default=10,
-                    help="Held-out shard index for offline paired eval (pretokenized mode only)")
+    ap.add_argument("--eval-shard", type=int, default=-1,
+                    help="Held-out shard index for offline paired eval (-1 = last shard)")
     ap.add_argument("--eval-mode", choices=("validator", "local"), default="validator",
                     help="validator: same holdout+sampling+bootstrap as eval_server; "
                          "local: fast eval on mining pool subset (optimistic)")
@@ -830,8 +870,8 @@ def main():
                          "(default: 64 zero hex digits, or TEUTONIC_SIM_BLOCK_HASH)")
     ap.add_argument("--sim-hotkey", default=os.environ.get("TEUTONIC_SIM_HOTKEY", ""),
                     help="Hotkey ss58 for validator-style holdout seeds (TEUTONIC_SIM_HOTKEY)")
-    ap.add_argument("--n-eval", type=int, default=5000,
-                    help="Public holdout sequences (validator default TEUTONIC_EVAL_N_PUBLIC=5000)")
+    ap.add_argument("--n-eval", type=int, default=25600,
+                    help="Public holdout sequences (validator default TEUTONIC_EVAL_N_PUBLIC=25600)")
     ap.add_argument("--n-eval-private", type=int, default=0,
                     help="Private holdout sequences (validator TEUTONIC_EVAL_N_PRIVATE)")
     ap.add_argument("--eval-batch-size", type=int, default=64,
@@ -887,7 +927,7 @@ def main():
         args.n_score = max(args.n_score, 12000)
         args.train_per_iter = max(args.train_per_iter, 10000)
         args.val_size = max(args.val_size, 500)
-        args.n_eval = max(args.n_eval, 5000)
+        args.n_eval = max(args.n_eval, 25600)
         args.epochs = max(args.epochs, 3.0)
         args.max_iters = max(args.max_iters, 5)
         args.lora_r = max(args.lora_r, 32)
@@ -1010,7 +1050,17 @@ def main():
                     f"--shard-start 0 --n-shards 1 --eval-shard 1."
                 )
 
-        train_shard_idxs = list(range(args.shard_start, args.shard_start + args.n_shards))
+        if args.eval_shard < 0:
+            args.eval_shard = n_manifest_shards - 1
+
+        if args.n_shards <= 0:
+            train_shard_idxs = [i for i in range(n_manifest_shards) if i != args.eval_shard]
+            log.info(
+                "loading all training shards: %d shard(s), holdout eval_shard=%d",
+                len(train_shard_idxs), args.eval_shard,
+            )
+        else:
+            train_shard_idxs = list(range(args.shard_start, args.shard_start + args.n_shards))
         for idx in train_shard_idxs:
             _check_shard_idx(idx, "training")
         _check_shard_idx(args.eval_shard, "eval")

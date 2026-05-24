@@ -86,7 +86,7 @@ def load_raw_sequences(
     seed_str: str,
     default_tokenizer_repo: str,
 ) -> tuple[list[list[int]], dict]:
-    """Return fixed-length token sequences sampled from raw mirrored Parquet."""
+    """Sample eval_n globally-random windows from all cached tokenized shards."""
     cfg = RawDatasetConfig.from_env(default_tokenizer_repo)
     files = _load_file_list(r2, cfg)
     if not files:
@@ -95,72 +95,70 @@ def load_raw_sequences(
             f"prefix={cfg.prefix!r}"
         )
 
-    seed = int.from_bytes(hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little")
-    rng = np.random.Generator(np.random.PCG64(seed))
-    start_idx = int(rng.integers(0, len(files)))
-    ordered = files[start_idx:] + files[:start_idx]
-
     from transformers import AutoTokenizer
-
     token = os.environ.get("HF_TOKEN") or None
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_repo, token=token, use_fast=True)
     eos_id = tokenizer.eos_token_id
     if eos_id is None:
         eos_id = tokenizer.sep_token_id
 
-    sequences: list[list[int]] = []
-    token_remainder: list[int] = []
-    used_files: list[str] = []
-    docs_seen = 0
+    npy_files = sorted(cfg.cache_dir.glob("*.tokens.npy"))
+    if not npy_files:
+        seed = int.from_bytes(hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little")
+        rng_file = np.random.Generator(np.random.PCG64(seed))
+        pick = int(rng_file.integers(0, len(files)))
+        _get_tokenized_npy(r2, cfg, files[pick]["key"], tokenizer, eos_id)
+        npy_files = sorted(cfg.cache_dir.glob("*.tokens.npy"))
 
-    for item in ordered[: cfg.max_files_per_eval]:
-        key = item["key"]
-        log.info("raw holdout: parquet %d/%d %s",
-                 len(used_files) + 1, min(cfg.max_files_per_eval, len(ordered)), key)
-        local_path = _download_parquet(r2, cfg, key)
-        used_files.append(key)
-        for text in _iter_parquet_texts(local_path, cfg.text_column):
-            docs_seen += 1
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if eos_id is not None:
-                ids.append(int(eos_id))
-            token_remainder.extend(ids)
-            while len(token_remainder) >= seq_len:
-                sequences.append(token_remainder[:seq_len])
-                token_remainder = token_remainder[seq_len:]
-                if len(sequences) >= eval_n:
-                    log.info("raw holdout: reached %d/%d sequences", len(sequences), eval_n)
-                    return sequences, _meta(cfg, files, used_files, docs_seen)
-                if len(sequences) % 500 == 0:
-                    log.info("raw holdout: tokenized %d/%d sequences", len(sequences), eval_n)
+    result, meta = sample_global_from_token_mmaps(npy_files, eval_n, seq_len, seed_str)
+    meta["manifest"] = cfg.manifest_key
+    meta["prefix"] = cfg.prefix
+    meta["tokenizer"] = cfg.tokenizer_repo
+    return result, meta
 
-    if not sequences:
-        raise RuntimeError(
-            f"raw dataset tokenization produced no {seq_len}-token windows "
-            f"from {len(used_files)} files"
-        )
-    log.warning(
-        "raw dataset produced only %d/%d requested sequences from %d files",
-        len(sequences), eval_n, len(used_files),
+
+def sample_global_from_token_mmaps(
+    npy_paths: list[pathlib.Path],
+    eval_n: int,
+    seq_len: int,
+    seed_str: str,
+) -> tuple[list[list[int]], dict]:
+    """Globally-random fixed-length windows from mmap'd flat uint32 token caches."""
+    mmaps = [np.load(p, mmap_mode="r") for p in npy_paths]
+    window_counts = [m.shape[0] // seq_len for m in mmaps]
+    total_windows = sum(window_counts)
+    if total_windows == 0:
+        raise RuntimeError("tokenized cache has zero usable windows")
+    cumsum = np.zeros(len(mmaps) + 1, dtype=np.int64)
+    for i, wc in enumerate(window_counts):
+        cumsum[i + 1] = cumsum[i] + wc
+
+    seed_int = int.from_bytes(hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little")
+    rng = np.random.Generator(np.random.PCG64(seed_int))
+    n = min(eval_n, total_windows)
+    indices = np.sort(rng.choice(total_windows, size=n, replace=False))
+
+    result = np.empty((n, seq_len), dtype=np.uint32)
+    fi = 0
+    for i, gi in enumerate(indices):
+        while gi >= cumsum[fi + 1]:
+            fi += 1
+        local = gi - cumsum[fi]
+        start = int(local) * seq_len
+        result[i] = mmaps[fi][start:start + seq_len]
+
+    log.info(
+        "global sample: %d windows from %d shards (%d total available)",
+        n, len(mmaps), total_windows,
     )
-    return sequences, _meta(cfg, files, used_files, docs_seen)
-
-
-def _meta(
-    cfg: RawDatasetConfig,
-    files: list[dict],
-    used_files: list[str],
-    docs_seen: int,
-) -> dict:
-    return {
-        "mode": "raw_hippius",
-        "manifest": cfg.manifest_key,
-        "prefix": cfg.prefix,
-        "tokenizer": cfg.tokenizer_repo,
-        "total_files": len(files),
-        "used_files": used_files,
-        "docs_seen": docs_seen,
+    meta = {
+        "mode": "raw_hippius_global",
+        "total_shards": len(npy_paths),
+        "total_windows": total_windows,
+        "sampled": n,
+        "used_files": [str(p.name) for p in npy_paths],
     }
+    return result.tolist(), meta
 
 
 def _load_file_list(r2, cfg: RawDatasetConfig) -> list[dict]:
@@ -239,6 +237,41 @@ def _iter_parquet_texts(path: pathlib.Path, text_column: str) -> Iterable[str]:
         for value in table.column(column).to_pylist():
             if isinstance(value, str) and value:
                 yield value
+
+
+def _get_tokenized_npy(
+    r2, cfg: RawDatasetConfig, key: str, tokenizer, eos_id: int | None,
+) -> np.ndarray:
+    """Return a flat uint32 token array for a parquet file, cached on disk."""
+    cache_key = hashlib.sha256(
+        f"{key}|{cfg.tokenizer_repo}".encode()
+    ).hexdigest()[:24]
+    npy_path = cfg.cache_dir / f"{cache_key}.tokens.npy"
+    if npy_path.exists() and npy_path.stat().st_size > 0:
+        log.info("tokenized cache HIT %s (%s)", key.rsplit("/", 1)[-1], npy_path.name)
+        return np.load(npy_path)
+
+    log.info("tokenizing %s (cache miss)", key.rsplit("/", 1)[-1])
+    local_path = _download_parquet(r2, cfg, key)
+    texts = list(_iter_parquet_texts(local_path, cfg.text_column))
+    log.info("batch-tokenizing %d documents", len(texts))
+    batch_enc = tokenizer(texts, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    all_ids: list[int] = []
+    eos_list = [int(eos_id)] if eos_id is not None else []
+    for ids in batch_enc:
+        all_ids.extend(ids)
+        all_ids.extend(eos_list)
+
+    arr = np.array(all_ids, dtype=np.uint32)
+    cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_npy = npy_path.with_suffix(".tmp.npy")
+    np.save(tmp_npy, arr)
+    tmp_npy.replace(npy_path)
+    log.info(
+        "tokenized cache WRITE %s: %d tokens (%.1f MB)",
+        npy_path.name, len(arr), arr.nbytes / 1e6,
+    )
+    return arr
 
 
 _FILE_HASH_CACHE: dict[str, tuple[int, float, str]] = {}

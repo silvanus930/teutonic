@@ -304,8 +304,8 @@ def main() -> None:
         "--block-hash", default=os.environ.get("TEUTONIC_SIM_BLOCK_HASH", DEFAULT_BLOCK_HASH),
         help="Pinned block hash for holdout seeds (default: 64 zero hex digits)",
     )
-    ap.add_argument("--n-public", type=int, default=1000,
-                    help="Public holdout sequences (validator default 5000)")
+    ap.add_argument("--n-public", type=int, default=25600,
+                    help="Public holdout sequences (validator default 25600)")
     ap.add_argument("--n-private", type=int, default=0,
                     help="Private holdout sequences (0 on current finney config)")
     ap.add_argument("--seq-len", type=int, default=2048)
