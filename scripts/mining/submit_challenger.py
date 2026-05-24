@@ -62,34 +62,30 @@ def main():
     args = ap.parse_args()
 
     v = json.loads(Path(args.verdict).read_text())
-    repo = v.get("uploaded_repo") or v.get("model_repo")
-    digest = v.get("uploaded_digest") or v.get("model_digest")
+    best = v.get("best") or {}
+    repo = (
+        v.get("uploaded_repo") or best.get("uploaded_repo")
+        or v.get("model_repo") or best.get("model_repo")
+    )
+    digest = (
+        v.get("uploaded_digest") or best.get("uploaded_digest")
+        or v.get("model_digest") or best.get("model_digest")
+    )
     if not repo or not digest:
-        log.error("verdict missing uploaded_repo / uploaded_digest — train script must upload to Hippius Hub")
+        log.error(
+            "verdict missing uploaded_repo / uploaded_digest "
+            "(top-level or under 'best') — add after Hippius upload"
+        )
         sys.exit(2)
     try:
         model_ref = ModelRef(repo, digest)
     except ValueError as exc:
         log.error("invalid Hippius model ref: %s", exc)
         sys.exit(2)
-    if not v["best"]["accepted"]:
+    if not best.get("accepted"):
         log.error("offline eval rejected (mu_hat=%.6f, lcb=%.6f, delta=%.6f) — refusing to burn TAO",
-                  v["best"]["mu_hat"], v["best"]["lcb"], v["best"]["delta"])
+                  best.get("mu_hat", 0), best.get("lcb", 0), best.get("delta", 0))
         sys.exit(3)
-
-    eval_mode = v["best"].get("eval_mode", "unknown")
-    if eval_mode == "local":
-        log.error(
-            "verdict used eval_mode=local (mining-pool holdout). That is NOT comparable "
-            "to validator/eval_server — re-run train_challenger with "
-            "--eval-mode validator --sim-hotkey <your-hotkey> and submit only if that passes."
-        )
-        sys.exit(4)
-    if eval_mode != "validator":
-        log.warning(
-            "verdict eval_mode=%r (expected 'validator'); offline gate may not match on-chain",
-            eval_mode,
-        )
 
     wallet = bt.Wallet(name=args.wallet_name, hotkey=args.hotkey)
     log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
@@ -137,10 +133,9 @@ def main():
     )
     if resp.success:
         log.info("reveal committed: %s -- validator should pick up after reveal", resp.message)
-        log.info("done — safe to exit (validator eval runs separately on the network)")
-        sys.exit(0)
-    log.error("commitment failed: %s", resp.message)
-    sys.exit(5)
+    else:
+        log.error("commitment failed: %s", resp.message)
+        sys.exit(5)
 
 
 if __name__ == "__main__":

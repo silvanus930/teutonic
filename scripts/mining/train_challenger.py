@@ -756,6 +756,8 @@ def run_lora_training(base_model: str, train_p: Path, val_p: Path,
         "--lora-alpha", str(args.lora_alpha),
         "--lora-dropout", "0.05",
     ]
+    if args.resume_checkpoint:
+        cmd.extend(["--resume-from-checkpoint", str(args.resume_checkpoint)])
     log.info("training: %s", " ".join(cmd))
     t0 = time.time()
     subprocess.check_call(cmd)
@@ -860,7 +862,53 @@ def main():
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--report-out", default="",
                     help="Write a final JSON verdict to this path")
+    ap.add_argument(
+        "--resume-checkpoint", default="",
+        help="Resume LoRA training from this Trainer checkpoint dir (skip scoring if "
+             "iter dir already has train.jsonl; use with --from-iter)",
+    )
+    ap.add_argument(
+        "--from-iter", type=int, default=-1,
+        help="Only run merge+eval for this iter index (skip score/train). "
+             "Use after interrupted training.",
+    )
+    ap.add_argument(
+        "--skip-scoring", action="store_true",
+        help="Reuse iter_XX/train.jsonl + val.jsonl (skip score/curate; skips shard reload "
+             "when --eval-mode validator)",
+    )
+    ap.add_argument(
+        "--profile", choices=("default", "prod"), default="default",
+        help="prod: wide local-shard curriculum + validator eval defaults",
+    )
     args = ap.parse_args()
+
+    if args.profile == "prod":
+        args.n_score = max(args.n_score, 12000)
+        args.train_per_iter = max(args.train_per_iter, 10000)
+        args.val_size = max(args.val_size, 500)
+        args.n_eval = max(args.n_eval, 5000)
+        args.epochs = max(args.epochs, 3.0)
+        args.max_iters = max(args.max_iters, 5)
+        args.lora_r = max(args.lora_r, 32)
+        args.lora_alpha = max(args.lora_alpha, 64)
+        args.lr = min(args.lr, 1e-4) if args.lr == 2e-4 else args.lr
+        args.target_mu = min(args.target_mu, 0.015)
+        args.eval_mode = "validator"
+        args.raw_max_files = max(args.raw_max_files, 32)
+        log.info("profile=prod applied (wide data + validator eval defaults)")
+
+    min_score = args.train_per_iter + args.val_size
+    if args.n_score < min_score:
+        log.warning(
+            "n_score=%d < train_per_iter+val_size=%d — curriculum will be undersized; "
+            "use --n-score >= %d (prod profile does this automatically)",
+            args.n_score, min_score, min_score + 500,
+        )
+
+    if args.eval_mode == "validator":
+        os.environ.setdefault("TEUTONIC_EVAL_DATASET_MODE", "raw_hippius")
+        os.environ.setdefault("TEUTONIC_RAW_TOKENIZER_REPO", "Qwen/Qwen3-4B")
 
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
@@ -896,14 +944,28 @@ def main():
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
 
-    # 2. dataset
-    manifest = fetch_manifest(cache)
     vocab_size = king_vocab_size(king_dir)
-    dataset_mode = resolve_dataset_mode(args.dataset_mode, manifest, king_dir)
-    log.info("dataset mode: %s (manifest tokenizer=%r, king vocab=%s)",
-             dataset_mode, manifest.get("tokenizer"), vocab_size)
+    shards: list = []
+    eval_arr = None
+    eval_indices = None
 
-    if dataset_mode == "raw":
+    skip_shard_load = (
+        args.skip_scoring
+        or args.from_iter >= 0
+    ) and args.eval_mode == "validator"
+
+    if skip_shard_load:
+        log.info(
+            "skipping dataset shard load (--skip-scoring or --from-iter, validator eval)"
+        )
+    else:
+        # 2. dataset
+        manifest = fetch_manifest(cache)
+        dataset_mode = resolve_dataset_mode(args.dataset_mode, manifest, king_dir)
+        log.info("dataset mode: %s (manifest tokenizer=%r, king vocab=%s)",
+                 dataset_mode, manifest.get("tokenizer"), vocab_size)
+
+    if not skip_shard_load and dataset_mode == "raw":
         n_needed = args.n_score + args.train_per_iter + args.val_size + 256
         if args.eval_mode == "local":
             n_needed += args.n_eval
@@ -933,7 +995,7 @@ def main():
                 "raw validator eval: holdout will be sampled per duel seeds "
                 "(not from mining pool)"
             )
-    else:
+    elif not skip_shard_load:
         n_manifest_shards = len(manifest.get("shards") or [])
         if n_manifest_shards == 0:
             raise ValueError("dataset manifest has no shards")
@@ -976,30 +1038,75 @@ def main():
 
     best = None
     history = []
-    for it in range(args.max_iters):
+    if args.from_iter >= 0:
+        iter_list = [args.from_iter]
+        log.info("from-iter mode: only processing iter_%02d", args.from_iter)
+    else:
+        iter_list = list(range(args.max_iters))
+    for it in iter_list:
         log.info("=" * 60)
         log.info("=== iteration %d/%d ===", it + 1, args.max_iters)
         log.info("=" * 60)
         seed = args.seed + 1000 * it
 
-        # 3+4. score+curate
         iter_work = work / f"iter_{it:02d}"
         iter_work.mkdir(exist_ok=True)
-        train_p, val_p = score_and_curate(
-            str(king_dir), shards, args.n_score,
-            args.train_per_iter, args.val_size, seed, "cuda:0", iter_work,
-        )
-
-        # 5. LoRA train
+        train_p = iter_work / "train.jsonl"
+        val_p = iter_work / "val.jsonl"
+        merge_only = args.from_iter >= 0
         out_dir = iter_work / "lora_out"
-        adapter = run_lora_training(
-            str(king_dir), train_p, val_p, out_dir, args.n_gpus, args,
-            Path(args.bundle),
-        )
-
-        # 6. merge
         merged_dir = iter_work / "merged"
-        merge_lora(str(king_dir), adapter, merged_dir)
+
+        if merge_only:
+            log.info("from-iter %d: merge+eval only (skip score+train)", it)
+            if not train_p.exists():
+                raise FileNotFoundError(
+                    f"--from-iter {it} but missing {train_p}; train first or use --skip-scoring"
+                )
+        elif args.skip_scoring and train_p.exists() and val_p.exists():
+            log.info(
+                "skip-scoring: reusing %s (%d lines) and %s",
+                train_p, sum(1 for _ in open(train_p)), val_p,
+            )
+        else:
+            if args.skip_scoring:
+                raise FileNotFoundError(
+                    f"--skip-scoring set but missing {train_p} or {val_p}; "
+                    "run scoring once or omit --skip-scoring"
+                )
+            train_p, val_p = score_and_curate(
+                str(king_dir), shards, args.n_score,
+                args.train_per_iter, args.val_size, seed, "cuda:0", iter_work,
+            )
+
+        if merge_only:
+            ckpt = (args.resume_checkpoint or "").strip()
+            if ckpt:
+                adapter = Path(ckpt)
+            elif (out_dir / "best_adapter").exists():
+                adapter = out_dir / "best_adapter"
+            else:
+                cks = sorted(out_dir.glob("checkpoint-*"),
+                             key=lambda p: int(p.name.split("-")[-1]))
+                if not cks:
+                    raise FileNotFoundError(
+                        f"no checkpoint under {out_dir}; pass --resume-checkpoint"
+                    )
+                adapter = cks[-1]
+                log.info("using latest checkpoint %s", adapter)
+        else:
+            resume_ckpt = (args.resume_checkpoint or "").strip() if it == iter_list[0] else ""
+            if resume_ckpt:
+                log.info("resuming LoRA from %s", resume_ckpt)
+            adapter = run_lora_training(
+                str(king_dir), train_p, val_p, out_dir, args.n_gpus, args,
+                Path(args.bundle),
+            )
+
+        if not merged_dir.exists() or not (merged_dir / "config.json").is_file():
+            merge_lora(str(king_dir), adapter, merged_dir)
+        else:
+            log.info("merged model already exists at %s", merged_dir)
 
         # 7. paired eval
         if args.eval_mode == "validator":

@@ -70,6 +70,11 @@ def main():
     ap.add_argument("--lora-dropout", type=float, default=0.05)
     ap.add_argument("--lora-target-modules", type=str, default=None,
                     help="comma-separated module name suffixes; defaults to a Quasar-aware set")
+    ap.add_argument(
+        "--resume-from-checkpoint",
+        default="",
+        help="Path to a Trainer checkpoint dir (e.g. iter_00/lora_out/checkpoint-200)",
+    )
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
@@ -138,7 +143,11 @@ def main():
         data_collator=Collator(),
     )
 
-    trainer.train()
+    resume = (args.resume_from_checkpoint or "").strip()
+    if resume:
+        trainer.train(resume_from_checkpoint=resume)
+    else:
+        trainer.train()
     trainer.save_model(os.path.join(args.output_dir, "best_adapter"))
     tokenizer.save_pretrained(os.path.join(args.output_dir, "best_adapter"))
 
