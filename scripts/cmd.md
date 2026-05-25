@@ -17,7 +17,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-q3-4b-5ev4mnnc-v13 /root/.cache/hippius/hub/models--scoutminer--teutonic-q3-4b-5hbdijfd-auto18/snapshots/auto18 --revision v13
+hippius-hub upload yoko/teutonic-q3-8b-5ev4mnnc-v1 /root/teutonic/s1-work-v2/iter_00/merged --revision v1
 
 mkdir -p teutonic-q3-download
 cd teutonic-q3-download
@@ -42,6 +42,8 @@ do
   hippius-hub download "$REPO" "$f" --revision "$REV"
 done
 
+tech-dev-ai/Teutonic-VIII-5CXiauzN-cru1
+
 cp -avL /root/.cache/hippius/hub/models--aetheling--teutonic-q3-4b-5cdd5hdj-v5/snapshots/main /root/teutonic/s1-work
 
 python submit_challenger.py \
@@ -54,23 +56,25 @@ python submit_challenger.py \
 
   hf upload silvanus0930/Teutonic-Q3-4B-Prod10T /root/teutonic/qwen3-fineweb-edu-prod10 . --repo-type dataset --commit-message "Upload"
 
+  hf download taoism99/Teutonic-VIII-5FnnkHKa-t01 /root/teutonic/s1-work/merged123
+
 export LOCAL_DATASET_MANIFEST="/path/to/your/5shard/manifest.json"
 
-export LOCAL_KING_DIR="/root/teutonic/s1-work/auto16"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/main"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
 export TEUTONIC_RAW_TOKENIZER_REPO="Qwen/Qwen3-4B"
 
 python -u scripts/mining/train_challenger.py \
-  --work /root/teutonic/s1-work \
+  --work /root/teutonic/s1-work-v2 \
   --bundle /root/teutonic/scripts/training_bundle \
   --dataset-mode auto \
   --n-shards 1 --shard-start 0 --eval-shard 1 \
   --eval-mode validator \
   --sim-hotkey "${TEUTONIC_SIM_HOTKEY}" \
-  --n-score 200 \
-  --train-per-iter 200 \
-  --val-size 50 \
+  --n-score 3000 \
+  --train-per-iter 2000 \
+  --val-size 100 \
   --n-eval 100 \
   --eval-gpus 0 \
   --n-gpus 1 \
@@ -88,13 +92,6 @@ python -u scripts/mining/train_challenger.py \
   --challenger /root/teutonic/s1-work-v2/iter_00/merged \
   --hotkey "${TEUTONIC_SIM_HOTKEY}"
 
----
-
-## Resume without re-scoring (after crash)
-
-If scoring finished (`iter_00/train.jsonl` exists) but training crashed:
-
-```bash
 export LOCAL_DATASET_MANIFEST="/root/teutonic/dataset/manifest.json"
 export LOCAL_KING_DIR="/root/teutonic/s1-work/main"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
@@ -110,14 +107,11 @@ python -u scripts/mining/train_challenger.py \
   --lr 2e-5 --epochs 1.0 --lora-r 32 --lora-alpha 64 \
   --max-iters 1 \
   --report-out /root/teutonic/s1-work/verdict.json
-```
-
-Skips ~18 min scoring and does **not** reload 4×2G shards.
-
 
 python scripts/mining/submit_challenger.py \
-  --verdict "/root/teutonic/s1-work/verdict.json" \
-  --wallet-name silvanus-hs2 \
-  --hotkey hotkey30 \
+  --uploaded_repo yoko/teutonic-q3-4b-5ev4mnnc-v17 \
+  --uploaded_hash sha256:eba5ce9df9cf12243099cca68606fe3822e0ca03ee839758650e9b13b5549f12 \
+  --wallet-name silvanus-hs1 \
+  --hotkey default \
   --netuid 3 \
   --network finney 
