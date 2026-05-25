@@ -92,6 +92,13 @@ python -u scripts/mining/train_challenger.py \
   --challenger /root/teutonic/s1-work-v2/iter_00/merged \
   --hotkey "${TEUTONIC_SIM_HOTKEY}"
 
+---
+
+## Resume without re-scoring (after crash)
+
+If scoring finished (`iter_00/train.jsonl` exists) but training crashed:
+
+```bash
 export LOCAL_DATASET_MANIFEST="/root/teutonic/dataset/manifest.json"
 export LOCAL_KING_DIR="/root/teutonic/s1-work/main"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
@@ -107,6 +114,10 @@ python -u scripts/mining/train_challenger.py \
   --lr 2e-5 --epochs 1.0 --lora-r 32 --lora-alpha 64 \
   --max-iters 1 \
   --report-out /root/teutonic/s1-work/verdict.json
+```
+
+Skips ~18 min scoring and does **not** reload 4×2G shards.
+
 
 python scripts/mining/submit_challenger.py \
   --uploaded_repo yoko/teutonic-q3-4b-5ev4mnnc-v17 \
@@ -115,3 +126,19 @@ python scripts/mining/submit_challenger.py \
   --hotkey default \
   --netuid 3 \
   --network finney 
+
+  python scripts/mining/submit_challenger.py \
+  --uploaded_repo yoko/teutonic-q3-8b-5ev4mnnc-v1 \
+  --uploaded_hash sha256:eb8058f9e386f745547ad4701ec8e0bb1fe25e0f66d67de2e103999e0e02ed53 \
+  --wallet-name silvanus-hs1 \
+  --hotkey default \
+  --netuid 3 \
+  --network finney 
+
+python scripts/mining/submit_challenger.py \
+  --uploaded-repo yoko/teutonic-q3-8b-5ev4mnnc-v1 \
+  --uploaded-digest sha256:eb8058f9e386f745547ad4701ec8e0bb1fe25e0f66d67de2e103999e0e02ed53 \
+  --wallet-name silvanus-hs1 \
+  --hotkey hotkey32 \
+  --netuid 3 \
+  --network finney
