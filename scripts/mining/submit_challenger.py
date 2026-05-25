@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """Submit a pre-built challenger to the chain.
 
-Reads a verdict.json produced by train_challenger.py (uploaded_repo,
-uploaded_digest) and posts the bittensor reveal commitment in the form
-`v4|{repo}|sha256:{manifest_digest}|{author_hotkey}`.
+Two ways to provide the Hippius model reference:
 
-The OCI manifest digest is the immutable commitment to the file tree.
+1. **Simple submit** — pass repo + digest on the CLI (no verdict.json):
 
-Run this on the templar host where the wallet lives.
+       python scripts/mining/submit_challenger.py \\
+         --uploaded-repo yoko/teutonic-q3-4b-5fhmoumc-v1 \\
+         --uploaded-digest sha256:... \\
+         --wallet-name silvanus-hs2 --hotkey hotkey30
+
+2. **Verdict file** — read from train_challenger.py / validator_eval.py output;
+   CLI flags override fields in the file:
+
+       python scripts/mining/submit_challenger.py \\
+         --verdict /root/teutonic/s1-work-v3/verdict.json \\
+         --wallet-name silvanus-hs2 --hotkey hotkey30
+
+Posts a bittensor reveal commitment:
+  `v4|{repo}|sha256:{manifest_digest}|{author_hotkey}`
+
+Run on the host where the wallet lives.
 
 IMPORTANT — coldkey gate (added 2026-04-29):
     The validator REJECTS any Hippius repo whose name does NOT contain the
-    first 8 ss58 chars of your **coldkey** (case-insensitive substring
-    match against the full "<account>/<basename>" string).
-
-    This stops anyone from re-revealing somebody else's Hippius URL under
-    their own hotkey: only YOU know your coldkey, and an imposter who
-    lifts your URL ends up advertising YOUR coldkey on chain — which is
-    self-incriminating.
-
-    So an Hippius repo like:
-        my-team/<chain.name>-5DhAqMpd-v3
-                             ^^^^^^^^
-    works (matches my coldkey 5DhAqMpd...). Without that prefix, the
-    validator will record your eval as `coldkey_required` and skip it.
-
-    This script will refuse to broadcast a reveal whose repo doesn't
-    contain your coldkey prefix — fail fast locally rather than burn
-    a tx for nothing.
+    first 8 ss58 chars of your **coldkey** (case-insensitive substring).
 """
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -39,53 +38,115 @@ import bittensor as bt
 
 from model_store import ModelRef, build_reveal_v4
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s [submit] %(message)s",
-                    datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [submit] %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("submit_challenger")
 
-# Must match validator.py's COLDKEY_PREFIX_LEN. If the validator side ever
-# changes this, miners need to update too.
 COLDKEY_PREFIX_LEN = 8
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--verdict", required=True,
-                    help="Path to verdict.json from train_challenger.py")
+def _resolve_model_ref(
+    verdict_path: str | None,
+    cli_repo: str | None,
+    cli_digest: str | None,
+) -> tuple[str, str, dict | None, bool]:
+    """Return (repo, digest, verdict_dict_or_none, simple_submit)."""
+    v: dict | None = None
+    if verdict_path:
+        v = json.loads(Path(verdict_path).read_text())
+
+    best = (v or {}).get("best") or {}
+    repo = (
+        cli_repo
+        or (v or {}).get("uploaded_repo")
+        or best.get("uploaded_repo")
+        or (v or {}).get("model_repo")
+        or best.get("model_repo")
+    )
+    digest = (
+        cli_digest
+        or (v or {}).get("uploaded_digest")
+        or best.get("uploaded_digest")
+        or (v or {}).get("model_digest")
+        or best.get("model_digest")
+    )
+    simple = bool(cli_repo and cli_digest and not verdict_path)
+    return (repo or "").strip(), (digest or "").strip(), v, simple
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Reveal a Hippius challenger model on-chain (v4 commitment).",
+    )
+    ap.add_argument(
+        "--verdict",
+        default="",
+        help="Optional verdict.json from train_challenger.py / validator_eval.py",
+    )
+    ap.add_argument(
+        "--uploaded-repo", "--uploaded_repo",
+        dest="uploaded_repo", default="",
+        help="Hippius repo id (simple submit; overrides verdict)",
+    )
+    ap.add_argument(
+        "--uploaded-digest", "--uploaded_digest",
+        dest="uploaded_digest", default="",
+        help="OCI manifest digest sha256:... (simple submit; overrides verdict)",
+    )
     ap.add_argument("--hotkey", default="h0")
     ap.add_argument("--wallet-name", default="teutonic")
     ap.add_argument("--netuid", type=int, default=3)
     ap.add_argument("--network", default="finney")
     ap.add_argument("--blocks-until-reveal", type=int, default=3)
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Submit even if verdict best.accepted is false (verdict mode only)",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    v = json.loads(Path(args.verdict).read_text())
-    best = v.get("best") or {}
-    repo = (
-        v.get("uploaded_repo") or best.get("uploaded_repo")
-        or v.get("model_repo") or best.get("model_repo")
-    )
-    digest = (
-        v.get("uploaded_digest") or best.get("uploaded_digest")
-        or v.get("model_digest") or best.get("model_digest")
-    )
+    verdict_path = (args.verdict or "").strip() or None
+    cli_repo = (args.uploaded_repo or "").strip() or None
+    cli_digest = (args.uploaded_digest or "").strip() or None
+
+    if not verdict_path and not (cli_repo and cli_digest):
+        ap.error(
+            "provide --uploaded-repo + --uploaded-digest (simple submit), "
+            "or --verdict (verdict file), or both (CLI overrides verdict)"
+        )
+    if (cli_repo and not cli_digest) or (cli_digest and not cli_repo):
+        ap.error("--uploaded-repo and --uploaded-digest must be given together")
+
+    repo, digest, v, simple_submit = _resolve_model_ref(verdict_path, cli_repo, cli_digest)
     if not repo or not digest:
         log.error(
-            "verdict missing uploaded_repo / uploaded_digest "
-            "(top-level or under 'best') — add after Hippius upload"
+            "missing Hippius model ref — set --uploaded-repo + --uploaded-digest, "
+            "or add uploaded_repo / uploaded_digest to verdict.json"
         )
         sys.exit(2)
+
     try:
         model_ref = ModelRef(repo, digest)
     except ValueError as exc:
         log.error("invalid Hippius model ref: %s", exc)
         sys.exit(2)
-    if not best.get("accepted"):
-        log.error("offline eval rejected (mu_hat=%.6f, lcb=%.6f, delta=%.6f) — refusing to burn TAO",
-                  best.get("mu_hat", 0), best.get("lcb", 0), best.get("delta", 0))
+
+    best = (v or {}).get("best") or {}
+    if v and not simple_submit and not best.get("accepted") and not args.force:
+        log.error(
+            "offline eval rejected (mu_hat=%.6f, lcb=%.6f, delta=%.6f) — "
+            "refusing to burn TAO (use --force to override)",
+            best.get("mu_hat", 0), best.get("lcb", 0), best.get("delta", 0),
+        )
         sys.exit(3)
+    if simple_submit:
+        log.info("simple submit: repo=%s digest=%s…%s", repo, digest[:14], digest[-8:])
+    elif cli_repo or cli_digest:
+        log.info("verdict + CLI override: repo=%s", repo)
 
     wallet = bt.Wallet(name=args.wallet_name, hotkey=args.hotkey)
     log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
@@ -98,10 +159,9 @@ def main():
             "(first %d chars of %s).\n"
             "    The validator will reject this submission with "
             "`coldkey_required` and your tx will be wasted.\n"
-            "    Rename your Hippius repo or Hippius namespace so its full id "
-            "contains '%s' (case-insensitive substring) anywhere — e.g.\n"
-            "        %s/<chain.name>-%s-v1\n"
-            "    then re-upload and rerun this script.",
+            "    Rename your Hippius repo so its full id contains '%s' "
+            "(case-insensitive), e.g.\n"
+            "        %s/<chain.name>-%s-v1",
             repo, expected_prefix, COLDKEY_PREFIX_LEN, coldkey_ss58,
             expected_prefix,
             repo.split("/", 1)[0] if "/" in repo else "<your-hippius-namespace>",

@@ -56,22 +56,22 @@ python submit_challenger.py \
 
 export LOCAL_DATASET_MANIFEST="/path/to/your/5shard/manifest.json"
 
-export LOCAL_KING_DIR="/root/teutonic/s1-work/main"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/auto16"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
 export TEUTONIC_RAW_TOKENIZER_REPO="Qwen/Qwen3-4B"
 
 python -u scripts/mining/train_challenger.py \
-  --work /root/teutonic/s1-work-v2 \
+  --work /root/teutonic/s1-work \
   --bundle /root/teutonic/scripts/training_bundle \
   --dataset-mode auto \
-  --n-shards 4 --shard-start 0 --eval-shard 4 \
+  --n-shards 1 --shard-start 0 --eval-shard 1 \
   --eval-mode validator \
   --sim-hotkey "${TEUTONIC_SIM_HOTKEY}" \
-  --n-score 15000 \
-  --train-per-iter 5000 \
-  --val-size 500 \
-  --n-eval 1000 \
+  --n-score 200 \
+  --train-per-iter 200 \
+  --val-size 50 \
+  --n-eval 100 \
   --eval-gpus 0 \
   --n-gpus 1 \
   --micro-batch 2 \
@@ -81,7 +81,7 @@ python -u scripts/mining/train_challenger.py \
   --lora-r 32 \
   --lora-alpha 64 \
   --max-iters 1 \
-  --report-out /root/teutonic/s1-work-v2/verdict.json
+  --report-out /root/teutonic/s1-work/verdict.json
 
   python -u scripts/mining/validator_eval.py \
   --king "${LOCAL_KING_DIR}" \

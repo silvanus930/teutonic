@@ -76,8 +76,8 @@ export TEUTONIC_RAW_MAX_FILES_PER_EVAL=32
 export TEUTONIC_SIM_HOTKEY="5FxJCGB1eaa8fNGT1yS5svPvHiEftGRKwx66ZcUvsm1SfXYc"
 
 python -u scripts/mining/validator_eval.py \
-  --king /root/teutonic/s1-work/5gzdd7oy-v3-s400 \
-  --challenger /root/teutonic/s1-work-v3/iter_00/merged \
+  --king /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-4b-5ek5koe5-22x4543-rn/snapshots/5Ek5KoE5-22x4543-rn \
+  --challenger /root/.cache/hippius/hub/models--scoutminer--teutonic-q3-4b-5hbdijfd-auto25/snapshots/auto25 \
   --report-out /root/teutonic/s1-work-v3/verdict.json
 
 
