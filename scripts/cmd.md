@@ -27,11 +27,27 @@ source .venv/bin/activate
 
 pip install hippius-hub
 
-REPO="aetheling/teutonic-q3-4b-5cdd5hdj-v5"
-REV="main"
+python <<'EOF'
+from hippius_hub import snapshot_download
+
+local_dir = snapshot_download(
+    repo_id="mastertensor/teutonic-q3-8b-5ek5koe5-11x3977-rn",
+    revision="5Ek5KoE5-11x3977-rn",
+    allow_patterns=["*.safetensors", "*.json"],
+    ignore_patterns="optimizer*",
+    max_workers=8,
+)
+print(local_dir)
+EOF
+
+REPO="mastertensor/teutonic-q3-8b-5ek5koe5-11x3977-rn"
+REV="5Ek5KoE5-11x3977-rn"
 
 for f in \
-  model.safetensors \
+  model-00001-of-00004.safetensors \
+  model-00002-of-00004.safetensors \
+  model-00003-of-00004.safetensors \
+  model-00004-of-00004.safetensors \
   tokenizer.json \
   model.safetensors.index.json \
   tokenizer_config.json \
@@ -55,6 +71,7 @@ python submit_challenger.py \
 
 
   hf upload silvanus0930/Teutonic-Q3-4B-Prod10T /root/teutonic/qwen3-fineweb-edu-prod10 . --repo-type dataset --commit-message "Upload"
+  hf upload silvanus0930/Teutonic-Q3-8B-Test /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-11x3977-rn/snapshots/5Ek5KoE5-11x3977-rn . --repo-type model --commit-message "Upload"
 
   hf download taoism99/Teutonic-VIII-5FnnkHKa-t01 /root/teutonic/s1-work/merged123
 
