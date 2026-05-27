@@ -18,7 +18,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-q3-8b-5ev4mnnc-v20 /root/teutonic/s1-work-v7/iter_00/merged --revision v20
+hippius-hub upload yoko/teutonic-q3-8b-5ev4mnnc-v20 /root/teutonic/s1-work-v8/iter_00/merged --revision v20_2
 hf download silvanus0930/Teutonic-Q3-8B-Test /root/teutonic/s1-work/merged
 
 hf download "silvanus0930/Teutonic-Q3-8B-Test" --local-dir "/root/teutonic/s1-work/merged"
@@ -44,8 +44,8 @@ local_dir = snapshot_download(
 print(local_dir)
 EOF
 
-REPO="mastertensor/teutonic-q3-8b-5ek5koe5-44x7285-rn"
-REV="5Ek5KoE5-44x7285-rn"
+REPO="mastertensor/teutonic-q3-8b-5ek5koe5-62x4059-rn"
+REV="5Ek5KoE5-62x4059-rn"
 
 for f in \
   model-00001-of-00004.safetensors \
@@ -87,21 +87,21 @@ python submit_challenger.py \
 //pretokenized 
 
 export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
-export LOCAL_KING_DIR="/root/teutonic/s1-work-v6/king"
+export LOCAL_KING_DIR="/root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-62x4059-rn/snapshots/5Ek5KoE5-62x4059-rn"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
 export TEUTONIC_RAW_TOKENIZER_REPO="Qwen/Qwen3-4B"
 export TEUTONIC_RAW_MAX_FILES_PER_EVAL=32
 
 python -u scripts/mining/train_challenger.py \
-  --work /root/teutonic/s1-work-v7 \
+  --work /root/teutonic/s1-work-v8 \
   --bundle /root/teutonic/scripts/training_bundle \
   --dataset-mode auto \
   --n-shards 10 --shard-start 0 --eval-shard 15 \
   --eval-mode validator \
   --sim-hotkey "${TEUTONIC_SIM_HOTKEY}" \
-  --n-score 3000 \
-  --train-per-iter 2000 \
+  --n-score 1000 \
+  --train-per-iter 800 \
   --val-size 200 \
   --n-eval 200 \
   --eval-gpus 0 \
@@ -127,8 +127,8 @@ python -u scripts/mining/validator_eval.py \
   --king /root/teutonic/s1-work-v7/king \
 
 python -u scripts/mining/validator_eval.py \
-  --king /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-44x15505-rn/snapshots/5Ek5KoE5-44x15505-rn \
-  --challenger /root/teutonic/s1-work-v7/iter_00/merged \
+  --king /root/teutonic/s1-work-v7/merged \
+  --challenger /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-62x4059-rn/snapshots/5Ek5KoE5-62x4059-rn \
   --n-public 500 \
   --local-dataset /root/teutonic/s1-work/dataset \
   --hotkey 5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv \
@@ -162,7 +162,7 @@ python -u scripts/mining/train_challenger.py \
 Skips ~18 min scoring and does **not** reload 4×2G shards.
 
 python scripts/mining/submit_challenger.py \
-  --uploaded-repo yoko/teutonic-q3-8b-5ev4mnnc-v19 \
+  --uploaded-repo yoko/teutonic-q3-8b-5ev4mnnc-v20 \
   --uploaded-digest sha256:3f9754272ada8ab3f1fdecedc6412ecf6b24b285750293977db82b4683c9b981 \
   --wallet-name silvanus-hs1 \
   --hotkey hotkey33 \
