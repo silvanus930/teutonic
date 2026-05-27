@@ -102,6 +102,47 @@ def load_raw_sequences(
     if eos_id is None:
         eos_id = tokenizer.sep_token_id
 
+    # Optional: force-mix across multiple parquet files per eval (deterministic by seed).
+    mix_env = (os.environ.get("TEUTONIC_RAW_MIX_FILES", "") or "").strip()
+    mix_n = int(mix_env) if mix_env else 0
+    mix_n = max(0, mix_n)
+    if mix_n:
+        max_n = max(1, int(cfg.max_files_per_eval))
+        want = min(mix_n, max_n, len(files))
+        seed = int.from_bytes(
+            hashlib.blake2b((seed_str + "|mix").encode(), digest_size=8).digest(),
+            "little",
+        )
+        rng_file = np.random.Generator(np.random.PCG64(seed))
+        picks = rng_file.choice(len(files), size=want, replace=False)
+        picks.sort()
+        chosen_keys = [files[int(i)]["key"] for i in picks.tolist()]
+        log.info(
+            "raw mix: tokenizing %d parquet file(s) (requested=%d, manifest=%d)",
+            want, mix_n, len(files),
+        )
+        for i, key in enumerate(chosen_keys, start=1):
+            log.info("raw mix [%d/%d]: %s", i, want, key.rsplit("/", 1)[-1])
+        npy_files = []
+        for key in chosen_keys:
+            _get_tokenized_npy(r2, cfg, key, tokenizer, eos_id)
+            cache_key = hashlib.sha256(f"{key}|{cfg.tokenizer_repo}".encode()).hexdigest()[:24]
+            npy_files.append(cfg.cache_dir / f"{cache_key}.tokens.npy")
+        npy_files = [p for p in npy_files if p.exists() and p.stat().st_size > 0]
+        if not npy_files:
+            raise RuntimeError("raw dataset mix requested but no token caches were produced")
+        result, meta = sample_global_from_token_mmaps(npy_files, eval_n, seq_len, seed_str)
+        meta["mode"] = "raw_hippius_mix"
+        meta["mixed_files_requested"] = mix_n
+        meta["mixed_files_used"] = len(chosen_keys)
+        meta["used_parquet_keys"] = chosen_keys
+        meta["used_npy_files"] = [str(p.name) for p in npy_files]
+        meta["used_files"] = chosen_keys
+        meta["manifest"] = cfg.manifest_key
+        meta["prefix"] = cfg.prefix
+        meta["tokenizer"] = cfg.tokenizer_repo
+        return result, meta
+
     npy_files = sorted(cfg.cache_dir.glob("*.tokens.npy"))
     if not npy_files:
         seed = int.from_bytes(hashlib.blake2b(seed_str.encode(), digest_size=8).digest(), "little")
