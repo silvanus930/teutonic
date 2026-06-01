@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile scripts/mining/train_challenger.py)",
+      "Bash(python -m py_compile scripts/mining/retokenize_fineweb_edu_qwen.py)",
+      "Bash(python -m py_compile scripts/training_bundle/train_lora_token_ids.py)"
+    ]
+  }
+}
