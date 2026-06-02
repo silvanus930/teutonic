@@ -185,7 +185,17 @@ def main():
         sys.exit(2)
 
     # Pre-flight: hotkey doesn't already have a reveal on chain.
-    revealed = sub.get_revealed_commitment_by_hotkey(args.netuid, hk_ss58)
+    # v4 commitments are plain-text payloads; older bittensor decoders expect hex
+    # and raise ValueError — treat that as "unknown / has commitment" and continue.
+    try:
+        revealed = sub.get_revealed_commitment_by_hotkey(args.netuid, hk_ss58)
+    except ValueError as exc:
+        log.warning(
+            "could not decode existing reveal(s) for hotkey (%s) — "
+            "likely v4 text commitments; continuing",
+            exc,
+        )
+        revealed = None
     if revealed:
         log.warning("hotkey already has %d reveal(s) on chain. The validator "
                     "may de-dupe and skip this submission. Continuing.", len(revealed))

@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import sys
+
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
@@ -31,6 +33,13 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, PeftModel, get_peft_model
+
+_mining = Path(__file__).resolve().parents[1] / "mining"
+if str(_mining) not in sys.path:
+    sys.path.insert(0, str(_mining))
+from hf_king_compat import hf_remote_code_kwargs, patch_transformers_quasar_compat  # noqa: E402
+
+patch_transformers_quasar_compat()
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +202,9 @@ def eval_adapter_val_loss(
 ) -> float:
     """Evaluate an adapter on val_ds, return mean CE loss. Runs on cuda:0 or cpu."""
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    _king_kw = hf_remote_code_kwargs(base_model)
     base = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=dtype, use_safetensors=True,
+        base_model, torch_dtype=dtype, use_safetensors=True, **_king_kw,
     )
     model = PeftModel.from_pretrained(base, str(adapter_dir)).to(device)
     model.eval()
@@ -306,11 +316,15 @@ def main() -> None:
     is_main = local_rank == 0
 
     # ---- Model ----
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    _king_kw = hf_remote_code_kwargs(args.base_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model, use_fast=True, **_king_kw,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=eval_dtype,
         use_safetensors=True,
+        **_king_kw,
     )
     model.config.use_cache = False
 

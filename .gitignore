@@ -68,3 +68,8 @@ s1-work-v9/
 s1-work-v10/
 qwen3-fineweb-edu-prod10-big/
 dataset/
+models/
+s1-remote/
+s1-wor1/
+s1-work1/
+smoke-test/

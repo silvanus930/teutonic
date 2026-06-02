@@ -54,7 +54,18 @@ from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_mining_dir = os.path.dirname(os.path.abspath(__file__))
+if _mining_dir not in sys.path:
+    sys.path.insert(0, _mining_dir)
+from hf_king_compat import (  # noqa: E402
+    hf_remote_code_kwargs as _hf_remote_code_kwargs,
+    king_subprocess_env,
+    patch_transformers_quasar_compat,
+)
+
+patch_transformers_quasar_compat()
+
+_repo_root = os.path.dirname(os.path.dirname(_mining_dir))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 import chain_config  # noqa: E402
@@ -372,7 +383,10 @@ def load_raw_sequences(
         _raw_mod._download_parquet = _http_download
 
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_repo, token=os.environ.get("HF_TOKEN") or None, use_fast=True,
+            tokenizer_repo,
+            token=os.environ.get("HF_TOKEN") or None,
+            use_fast=True,
+            **_hf_remote_code_kwargs(tokenizer_repo),
         )
         eos_id = tokenizer.eos_token_id or tokenizer.sep_token_id
         npy_files = sorted(token_cache.glob("*.tokens.npy"))
@@ -510,13 +524,13 @@ def paired_eval(
     log.info("paired_eval: loading king %s on %s", king_dir, device)
     king = AutoModelForCausalLM.from_pretrained(
         king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True,
+        use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
     )
     king.eval()
     log.info("paired_eval: loading challenger %s", chall_dir)
     chall = AutoModelForCausalLM.from_pretrained(
         chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True,
+        use_safetensors=True, **_hf_remote_code_kwargs(chall_dir),
     )
     chall.eval()
 
@@ -762,7 +776,7 @@ def score_and_curate(
         t_score = time.time()
         model = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True,
+            use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
         )
         model.eval()
 
@@ -1055,7 +1069,7 @@ def run_lora_training(
         cmd.extend(["--resume-from-checkpoint", resume])
     log.info("training: %s", " ".join(cmd))
     t0 = time.time()
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, env=king_subprocess_env(base_model))
     log.info("training done in %.1fs", time.time() - t0)
 
     adapter = out_dir / "best_adapter"
@@ -1068,18 +1082,28 @@ def run_lora_training(
     return adapter
 
 
-def merge_lora(base_model: str, adapter: Path | str, out: Path | str) -> Path:
+def merge_lora(
+    base_model: str, adapter: Path | str, out: Path | str,
+    max_shard_size: str = "",
+) -> Path:
     adapter = Path(adapter)
     out = Path(out)
     log.info("merging LoRA %s into %s -> %s", adapter, base_model, out)
     from peft import PeftModel
     base = AutoModelForCausalLM.from_pretrained(
         base_model, torch_dtype=torch.bfloat16, use_safetensors=True,
+        **_hf_remote_code_kwargs(base_model),
     )
     merged = PeftModel.from_pretrained(base, str(adapter)).merge_and_unload()
     out.mkdir(parents=True, exist_ok=True)
-    merged.save_pretrained(str(out), safe_serialization=True)
-    tok = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    save_kw: dict = {"safe_serialization": True}
+    if max_shard_size:
+        save_kw["max_shard_size"] = max_shard_size
+        log.info("merge save: sharding weights max_shard_size=%s", max_shard_size)
+    merged.save_pretrained(str(out), **save_kw)
+    tok = AutoTokenizer.from_pretrained(
+        base_model, use_fast=True, **_hf_remote_code_kwargs(base_model),
+    )
     tok.save_pretrained(str(out))
     base_path = Path(base_model).expanduser().resolve()
     for name in ("config.json", "generation_config.json"):
@@ -1089,6 +1113,10 @@ def merge_lora(base_model: str, adapter: Path | str, out: Path | str) -> Path:
             src = Path(snapshot_download(base_model, allow_patterns=[name])) / name
         if src.is_file():
             shutil.copy(src, out / name)
+    for py_name in ("configuration_qwen3_5.py", "modeling_qwen3_5.py"):
+        src_py = base_path / py_name
+        if src_py.is_file():
+            shutil.copy(src_py, out / py_name)
     del base, merged
     torch.cuda.empty_cache()
     log.info("merged model saved to %s", out)
@@ -1379,6 +1407,11 @@ def main():
     ap.add_argument("--upload-repo", default="")
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--report-out", default="")
+    ap.add_argument(
+        "--merge-max-shard-size", default=os.environ.get("TEUTONIC_MERGE_MAX_SHARD_SIZE", ""),
+        help="Shard merged safetensors on save, e.g. 3500MB or 3.5GB (Hippius upload). "
+             "Default: single model.safetensors file.",
+    )
 
     args = ap.parse_args()
 
@@ -1824,7 +1857,10 @@ def main():
 
         # --- Merge ---
         if not merged_dir.exists() or not (merged_dir / "config.json").is_file():
-            merge_lora(str(king_dir), adapter, merged_dir)
+            merge_lora(
+                str(king_dir), adapter, merged_dir,
+                max_shard_size=(args.merge_max_shard_size or "").strip(),
+            )
         else:
             log.info("merged model already at %s", merged_dir)
 
