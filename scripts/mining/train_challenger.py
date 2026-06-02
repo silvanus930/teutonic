@@ -206,6 +206,18 @@ def download_shard(shard_key: str, out: Path) -> Path:
     return out
 
 
+def _resolve_local_manifest_paths(m: dict, base: Path) -> None:
+    """Turn relative shard keys into absolute paths under the manifest directory."""
+    for field in ("shards", "train_shards", "eval_shards"):
+        for s in m.get(field) or []:
+            key = (s.get("key") or "").strip()
+            if not key:
+                continue
+            kp = Path(key)
+            if not kp.is_absolute():
+                s["key"] = str((base / key).resolve())
+
+
 def fetch_manifest(cache: Path, local_manifest_path: str = "") -> dict:
     local = local_manifest_path or os.environ.get("LOCAL_DATASET_MANIFEST", "")
     if local:
@@ -214,12 +226,7 @@ def fetch_manifest(cache: Path, local_manifest_path: str = "") -> dict:
             raise FileNotFoundError(f"local dataset manifest not found: {p}")
         log.info("loading local dataset manifest: %s", p)
         m = json.loads(p.read_text())
-        base = p.parent
-        for s in m.get("shards", []):
-            key = s.get("key", "")
-            kp = Path(key)
-            if key and not kp.is_absolute():
-                s["key"] = str((base / key).resolve())
+        _resolve_local_manifest_paths(m, p.parent)
         return m
 
     p = cache / "manifest.json"
@@ -987,7 +994,11 @@ def score_and_curate(
                               for b in ("general", "hard", "easy")},
         "train_loss": _loss_summary(np.asarray([r["loss"] for r in train_rows])) if train_rows else {},
         "val_loss": _loss_summary(np.asarray([r["loss"] for r in val_rows])) if val_rows else {},
-        "shards_used": shard_indices,
+        # Report which shards participated in scoring/curriculum.
+        # For pretokenized manifests this is a list of manifest keys; for raw mode
+        # it's a single synthetic pool key.
+        "shards_used": sampled_keys,
+        "shards_used_local_indices": sampled_local_idxs,
     }
     json.dump(scoring_report, open(scoring_p, "w"), indent=2)
     json.dump(curriculum_report, open(curriculum_p, "w"), indent=2)
@@ -1003,6 +1014,7 @@ def run_lora_training(
     base_model: str, train_p: Path, val_p: Path,
     out_dir: Path, n_gpus: int, args: argparse.Namespace,
     bundle: Path,
+    resume_checkpoint: str = "",
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -1038,8 +1050,9 @@ def run_lora_training(
         cmd.append("--gradient-checkpointing")
     else:
         cmd.append("--no-gradient-checkpointing")
-    if args.resume_checkpoint:
-        cmd.extend(["--resume-from-checkpoint", str(args.resume_checkpoint)])
+    resume = (resume_checkpoint or args.resume_checkpoint or "").strip()
+    if resume:
+        cmd.extend(["--resume-from-checkpoint", resume])
     log.info("training: %s", " ".join(cmd))
     t0 = time.time()
     subprocess.check_call(cmd)
@@ -1350,7 +1363,10 @@ def main():
                          "0 = disabled. Averaged model used only if it improves val loss.")
 
     # Resume / skip
-    ap.add_argument("--resume-checkpoint", default="")
+    ap.add_argument("--resume-checkpoint", default="",
+                    help="LoRA adapter dir to resume training from (overrides auto-chain).")
+    ap.add_argument("--no-chain-lora", action="store_true",
+                    help="Do not resume iter N>0 from iter_{N-1}/lora/best_adapter.")
     ap.add_argument("--from-iter", type=int, default=-1)
     ap.add_argument("--skip-scoring", action="store_true")
     ap.add_argument("--force", action="store_true",
@@ -1481,24 +1497,34 @@ def main():
 
     # ---- 1. King ----
     king = fetch_king()
-    king_dir = work / "king"
+    work_king_dir = work / "king"
     local_king = os.environ.get("LOCAL_KING_DIR", "")
     if local_king:
         local_king_p = Path(local_king)
         if not local_king_p.exists():
             raise FileNotFoundError(f"LOCAL_KING_DIR not found: {local_king_p}")
-        if king_dir.exists():
-            shutil.rmtree(king_dir)
-        log.info("copying local king %s -> %s", local_king_p, king_dir)
-        shutil.copytree(local_king_p, king_dir, symlinks=False)
+        # Use the pointed king directory in-place (avoid copying / overwriting).
+        king_dir = local_king_p.resolve()
+        if king_dir == work_king_dir.resolve():
+            raise ValueError(
+                f"LOCAL_KING_DIR must not be {work_king_dir} (use a real folder like "
+                f"{work / 'king1'} to avoid symlink loops with hf download)"
+            )
+        log.info("using LOCAL_KING_DIR in-place: %s", king_dir)
     else:
+        king_dir = work_king_dir
         if king_dir.exists():
             shutil.rmtree(king_dir)
         log.info("downloading king to %s", king_dir)
+        rev = king.get("king_revision") or None
+        # Dashboard revisions may be encoded as immutable digests like "hf:<commit>".
+        # huggingface_hub expects the raw git commit hash (without the "hf:" prefix).
+        if isinstance(rev, str) and rev.startswith("hf:"):
+            rev = rev[len("hf:"):]
         snapshot_download(
             king["hf_repo"],
             local_dir=str(king_dir),
-            revision=king.get("king_revision") or None,
+            revision=rev,
             token=args.hf_token or None,
             max_workers=16,
         )
@@ -1542,6 +1568,26 @@ def main():
                 model_vocab_size=vocab_size,
             )
             shards = [pool]
+            # Raw mode yields a single in-memory pool rather than manifest-addressed shards.
+            # Still provide a stable synthetic shard key so score caching and curriculum
+            # bookkeeping can work uniformly.
+            # IMPORTANT: raw pools are sampled and can vary with seed, max_files,
+            # and the number of sequences requested. Include these in the cache key
+            # to avoid reusing cached (shard, idx) pairs that don't exist in a new pool.
+            raw_key_material = json.dumps(
+                {
+                    "dataset_mode": "raw",
+                    "manifest_tokenizer": manifest.get("tokenizer"),
+                    "seq_len": args.seq_len,
+                    "tokenizer_repo": tokenizer_repo,
+                    "vocab_size": int(vocab_size),
+                    "seed": int(args.seed),
+                    "raw_max_files": int(args.raw_max_files),
+                    "n_needed": int(n_needed),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            shard_keys = [f"raw_pool_{hashlib.sha256(raw_key_material).hexdigest()[:16]}"]
             if args.eval_mode == "local":
                 eval_arr = pool
                 rng_eval = np.random.default_rng(0xE1A)
@@ -1762,12 +1808,18 @@ def main():
                     raise FileNotFoundError(f"no checkpoint under {out_dir}")
                 adapter = cks[-1]
         else:
-            resume = (args.resume_checkpoint or "").strip() if it == iter_list[0] else ""
-            if resume:
+            resume = (args.resume_checkpoint or "").strip()
+            if not resume and not args.no_chain_lora and it > 0:
+                prev_adapter = work / f"iter_{it-1:02d}" / "lora" / "best_adapter"
+                if prev_adapter.is_dir():
+                    resume = str(prev_adapter)
+                    log.info("chaining LoRA from iter_%02d: %s", it - 1, resume)
+            elif resume:
                 log.info("resuming LoRA from %s", resume)
             adapter = run_lora_training(
                 str(king_dir), train_p, val_p, out_dir,
                 args.n_gpus, args, Path(args.bundle),
+                resume_checkpoint=resume,
             )
 
         # --- Merge ---

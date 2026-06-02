@@ -74,7 +74,7 @@ python submit_challenger.py \
   --network finney
 
 
-  hf upload silvanus0930/Teutonic-Q3-4B-Prod10T /root/teutonic/qwen3-fineweb-edu-prod10 . --repo-type dataset --commit-message "Upload"
+  hf upload silvanus0930/Teutonic-Q3-8B-Full /root/teutonic/dataset/fineweb_edu_qwen3_2048 . --repo-type dataset --commit-message "Upload"
   hf upload silvanus0930/Teutonic-Q3-8B-Test /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-11x3977-rn/snapshots/5Ek5KoE5-11x3977-rn . --repo-type model --commit-message "Upload"
 
   hf download taoism99/Teutonic-VIII-5FnnkHKa-t01 /root/teutonic/s1-work/merged123
@@ -84,26 +84,32 @@ python submit_challenger.py \
   --repo-type dataset \
   --local-dir /root/teutonic/s1-work/dataset
 
-//pretokenized 
+//pretokenized local shards (fineweb_edu_qwen3_2048: 4 train + 1 eval)
 
-export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
+export LOCAL_DATASET_MANIFEST="/root/teutonic/dataset/fineweb_edu_qwen3_2048/manifest.json"
 export LOCAL_KING_DIR="/root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-62x4059-rn/snapshots/5Ek5KoE5-62x4059-rn"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
 export TEUTONIC_RAW_TOKENIZER_REPO="Qwen/Qwen3-4B"
 export TEUTONIC_RAW_MAX_FILES_PER_EVAL=32
 
+# Continue from iter_00 (already trained):
+#   - iter with verdict.json is skipped automatically
+#   - score_cache/ reuses king scores for this manifest; iter_01+ get new curriculum mixes
+#   - LoRA chains from iter_{n-1}/lora/best_adapter (use --no-chain-lora to disable)
+#   - n-shards 4 = all train shards; use --n-shards 1 --shard-start N to score one shard per run
 python -u scripts/mining/train_challenger.py \
-  --work /root/teutonic/s1-work-v8 \
+  --work /root/teutonic/s1-work \
   --bundle /root/teutonic/scripts/training_bundle \
-  --dataset-mode auto \
-  --n-shards 10 --shard-start 0 --eval-shard 15 \
+  --dataset-mode local \
+  --local-dataset-manifest "${LOCAL_DATASET_MANIFEST}" \
+  --n-shards 4 --shard-start 0 \
   --eval-mode validator \
   --sim-hotkey "${TEUTONIC_SIM_HOTKEY}" \
-  --n-score 1000 \
-  --train-per-iter 800 \
-  --val-size 200 \
-  --n-eval 200 \
+  --n-score 15000 \
+  --train-per-iter 8000 \
+  --val-size 600 \
+  --n-eval 500 \
   --eval-gpus 0 \
   --n-gpus 1 \
   --micro-batch 8 \
@@ -112,7 +118,8 @@ python -u scripts/mining/train_challenger.py \
   --epochs 1.0 \
   --lora-r 32 \
   --lora-alpha 64 \
-  --max-iters 1 \
+  --max-iters 3 \
+  --use-local-score-cache \
   --report-out /root/teutonic/s1-work/verdict.json
 
 # Hippius raw parquet holdout (download + tokenize)
