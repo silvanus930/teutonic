@@ -18,7 +18,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-q3-8b-5ev4mnnc-v20 /root/teutonic/s1-work-v8/iter_00/merged --revision v20_2
+hippius-hub upload yoko/teutonic-5ev4mnnc-001 /root/teutonic/models/king1-bf16 --revision main
 hf download silvanus0930/Teutonic-Q3-8B-Test /root/teutonic/s1-work/merged
 
 hf download "silvanus0930/Teutonic-Q3-8B-Test" --local-dir "/root/teutonic/s1-work/merged"
@@ -77,7 +77,7 @@ python submit_challenger.py \
   hf upload silvanus0930/Teutonic-Q3-8B-Full /root/teutonic/dataset/fineweb_edu_qwen3_2048 . --repo-type dataset --commit-message "Upload"
   hf upload silvanus0930/Teutonic-Q3-8B-Test /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-11x3977-rn/snapshots/5Ek5KoE5-11x3977-rn . --repo-type model --commit-message "Upload"
 
-  hf download taoism99/Teutonic-VIII-5FnnkHKa-t01 /root/teutonic/s1-work/merged123
+  hf download silvanus0930/teutonic-q3-10b-5hbdijfd-auto02 --local-dir /root/teutonic/s1-work/merged123
   hf download silvanus0930/Bad-set --local-dir /root/teutonic/s1-work/dataset
 
   hf download silvanus0930/Bad-set \
@@ -168,10 +168,39 @@ python -u scripts/mining/train_challenger.py \
 
 Skips ~18 min scoring and does **not** reload 4×2G shards.
 
+hippius-hub upload yoko/teutonic-5ev4mnnc-006 /root/teutonic/s1-work/merged123 --revision main
+
 python scripts/mining/submit_challenger.py \
-  --uploaded-repo yoko/teutonic-q3-8b-5ev4mnnc-v20 \
-  --uploaded-digest sha256:3f9754272ada8ab3f1fdecedc6412ecf6b24b285750293977db82b4683c9b981 \
+  --uploaded-repo yoko/teutonic-5ev4mnnc-006 \
+  --uploaded-digest sha256:06212d910349f515871646347bf4ee8ae9743a8b32b68a45245a139c543578c2 \
   --wallet-name silvanus-hs1 \
-  --hotkey hotkey33 \
+  --hotkey hotkey38 \
   --netuid 3 \
   --network finney
+
+python scripts/mining/submit_challenger.py \
+  --uploaded-repo "silvanus0930/teutonic-q3-4b-5ev4mnnc-006" \
+  --uploaded-digest "sha256:YOUR_HIPPIUS_DIGEST" \
+  --wallet YOUR_WALLET \
+  --hotkey YOUR_HOTKEY \
+  --netuid 3 \
+  --network finney
+
+python scripts/mining/submit_external_model.py \
+  --hf silvanus0930/teutonic-5ev4mnnc-006 \
+  --hippius-namespace silvanus0930 \
+  --wallet silvanus-hs1 \
+  --hotkey hotkey38 \
+  --workdir /root/teutonic/s1-wor1/iter_00/merged \
+  --skip-download \
+  --dry-run
+
+python scripts/mining/submit_external_model.py \
+  --hf silvanus0930/teutonic-5ev4mnnc-006 \
+  --hippius-namespace silvanus0930 \
+  --wallet silvanus-hs1 \
+  --hotkey hotkey37 \
+  --workdir /root/teutonic/s1-wor1/iter_00/merged \
+  --skip-download \
+  --suffix 006 \
+  --dry-run
