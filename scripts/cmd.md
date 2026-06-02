@@ -86,18 +86,13 @@ python submit_challenger.py \
 
 //pretokenized local shards (fineweb_edu_qwen3_2048: 4 train + 1 eval)
 
-export LOCAL_DATASET_MANIFEST="/root/teutonic/dataset/fineweb_edu_qwen3_2048/manifest.json"
-export LOCAL_KING_DIR="/root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-62x4059-rn/snapshots/5Ek5KoE5-62x4059-rn"
+export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/king1"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
-export TEUTONIC_RAW_TOKENIZER_REPO="Qwen/Qwen3-4B"
-export TEUTONIC_RAW_MAX_FILES_PER_EVAL=32
+export TEUTONIC_RAW_TOKENIZER_REPO="${LOCAL_KING_DIR}" 
+export TEUTONIC_RAW_MAX_FILES_PER_EVAL=4
 
-# Continue from iter_00 (already trained):
-#   - iter with verdict.json is skipped automatically
-#   - score_cache/ reuses king scores for this manifest; iter_01+ get new curriculum mixes
-#   - LoRA chains from iter_{n-1}/lora/best_adapter (use --no-chain-lora to disable)
-#   - n-shards 4 = all train shards; use --n-shards 1 --shard-start N to score one shard per run
 python -u scripts/mining/train_challenger.py \
   --work /root/teutonic/s1-work \
   --bundle /root/teutonic/scripts/training_bundle \
@@ -107,18 +102,18 @@ python -u scripts/mining/train_challenger.py \
   --eval-mode validator \
   --sim-hotkey "${TEUTONIC_SIM_HOTKEY}" \
   --n-score 15000 \
-  --train-per-iter 8000 \
+  --train-per-iter 10000 \
   --val-size 600 \
   --n-eval 500 \
   --eval-gpus 0 \
   --n-gpus 1 \
-  --micro-batch 8 \
+  --micro-batch 4 \
   --grad-accum 4 \
-  --lr 6e-6 \
+  --lr 2e-5 \
   --epochs 1.0 \
   --lora-r 32 \
   --lora-alpha 64 \
-  --max-iters 3 \
+  --max-iters 1 \
   --use-local-score-cache \
   --report-out /root/teutonic/s1-work/verdict.json
 
