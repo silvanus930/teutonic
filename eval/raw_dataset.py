@@ -158,15 +158,36 @@ def load_raw_sequences(
     return result, meta
 
 
+def _shard_window_count(arr: np.ndarray, seq_len: int) -> int:
+    """Rows in a pretokenized shard: 2D (n_seq, seq_len) or 1D flat tokens."""
+    if arr.ndim == 1:
+        return arr.shape[0] // seq_len
+    if arr.ndim == 2:
+        if arr.shape[1] != seq_len:
+            raise ValueError(
+                f"2D shard has seq_len={arr.shape[1]}, expected {seq_len}"
+            )
+        return arr.shape[0]
+    raise ValueError(f"unsupported shard ndim={arr.ndim}, shape={arr.shape}")
+
+
+def _shard_window_slice(arr: np.ndarray, local: int, seq_len: int) -> np.ndarray:
+    """Extract one seq_len window from a mmap'd 1D or 2D uint32 shard."""
+    if arr.ndim == 1:
+        start = int(local) * seq_len
+        return arr[start:start + seq_len]
+    return arr[int(local)]
+
+
 def sample_global_from_token_mmaps(
     npy_paths: list[pathlib.Path],
     eval_n: int,
     seq_len: int,
     seed_str: str,
 ) -> tuple[list[list[int]], dict]:
-    """Globally-random fixed-length windows from mmap'd flat uint32 token caches."""
+    """Globally-random fixed-length windows from mmap'd uint32 token caches (1D or 2D)."""
     mmaps = [np.load(p, mmap_mode="r") for p in npy_paths]
-    window_counts = [m.shape[0] // seq_len for m in mmaps]
+    window_counts = [_shard_window_count(m, seq_len) for m in mmaps]
     total_windows = sum(window_counts)
     if total_windows == 0:
         raise RuntimeError("tokenized cache has zero usable windows")
@@ -185,8 +206,7 @@ def sample_global_from_token_mmaps(
         while gi >= cumsum[fi + 1]:
             fi += 1
         local = gi - cumsum[fi]
-        start = int(local) * seq_len
-        result[i] = mmaps[fi][start:start + seq_len]
+        result[i] = _shard_window_slice(mmaps[fi], int(local), seq_len)
 
     log.info(
         "global sample: %d windows from %d shards (%d total available)",

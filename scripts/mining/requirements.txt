@@ -5,3 +5,8 @@ huggingface_hub>=0.26
 safetensors>=0.4
 accelerate>=1.0
 numpy>=1.26
+
+# Quasar kings (bundled modeling_qwen3_5.py) also need:
+#   pip install "flash-linear-attention @ git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git@84ad1cc5a7428609d7e0e56d4041a775cd19b7bb"
+#   pip install "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu13torch25.12cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+# (pick the causal-conv1d wheel matching your torch/cuda/python ABI; see Dao-AILab/causal-conv1d releases)

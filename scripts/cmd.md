@@ -18,7 +18,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-5ev4mnnc-001 /root/teutonic/models/king1-bf16 --revision main
+hippius-hub upload yoko/teutonic-5ev4mnnc-011 /root/teutonic/s1-work/iter_00/merged --revision main
 hf download silvanus0930/Teutonic-Q3-8B-Test /root/teutonic/s1-work/merged
 
 hf download "silvanus0930/Teutonic-Q3-8B-Test" --local-dir "/root/teutonic/s1-work/merged"
@@ -44,14 +44,17 @@ local_dir = snapshot_download(
 print(local_dir)
 EOF
 
-REPO="mastertensor/teutonic-q3-8b-5ek5koe5-62x4059-rn"
-REV="5Ek5KoE5-62x4059-rn"
+REPO="mastertensor/teutonic-q3-10b-5ek5koe5-78819105797-rn"
+REV="5Ek5KoE5-78819105797-rn"
 
 for f in \
-  model-00001-of-00004.safetensors \
-  model-00002-of-00004.safetensors \
-  model-00003-of-00004.safetensors \
-  model-00004-of-00004.safetensors \
+  model-00001-of-00005.safetensors \
+  model-00002-of-00005.safetensors \
+  model-00003-of-00005.safetensors \
+  model-00004-of-00005.safetensors \
+  model-00005-of-00005.safetensors \
+  modeling_qwen3_5.py \
+  configuration_qwen3_5.py \
   tokenizer.json \
   model.safetensors.index.json \
   tokenizer_config.json \
@@ -64,7 +67,7 @@ done
 
 tech-dev-ai/Teutonic-VIII-5CXiauzN-cru1
 
-cp -avL /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-22x3581-rn/snapshots/5Ek5KoE5-22x3581-rn /root/teutonic/s1-work
+cp -avL /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-78819105797-rn/snapshots/5Ek5KoE5-78819105797-rn /root/teutonic/s1-work
 
 python submit_challenger.py \
   --verdict /root/teutonic/s1-work/verdict.json \
@@ -77,8 +80,8 @@ python submit_challenger.py \
   hf upload silvanus0930/Teutonic-Q3-8B-Full /root/teutonic/dataset/fineweb_edu_qwen3_2048 . --repo-type dataset --commit-message "Upload"
   hf upload silvanus0930/Teutonic-Q3-8B-Test /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-8b-5ek5koe5-11x3977-rn/snapshots/5Ek5KoE5-11x3977-rn . --repo-type model --commit-message "Upload"
 
-  hf download silvanus0930/teutonic-q3-10b-5hbdijfd-auto02 --local-dir /root/teutonic/s1-work/merged123
-  hf download silvanus0930/Bad-set --local-dir /root/teutonic/s1-work/dataset
+  hf download silvanus0930/Teutonic-Q35-8B-Test --local-dir /root/teutonic/s1-work/dataset --repo-type dataset
+  hf download tech-dev-ai/teutonic-5g6x3hrj-top30 --local-dir /root/teutonic/s1-work/temp
 
   hf download silvanus0930/Bad-set \
   --repo-type dataset \
@@ -107,13 +110,13 @@ python -u scripts/mining/train_challenger.py \
   --n-eval 500 \
   --eval-gpus 0 \
   --n-gpus 1 \
-  --micro-batch 4 \
-  --grad-accum 4 \
-  --lr 2e-5 \
+  --micro-batch 2 \
+  --grad-accum 8 \
+  --lr 2e-6 \
   --epochs 1.0 \
   --lora-r 32 \
   --lora-alpha 64 \
-  --max-iters 1 \
+  --max-iters 5 \
   --use-local-score-cache \
   --report-out /root/teutonic/s1-work/verdict.json
 
@@ -199,3 +202,34 @@ python scripts/mining/submit_external_model.py \
   --skip-download \
   --suffix 006 \
   --dry-run
+
+
+  python -u scripts/mining/validator_eval.py \
+  --king /root/teutonic/s1-work/king1 \
+  --challenger /root/teutonic/s1-work/iter_00/merged \
+  --hotkey "${TEUTONIC_SIM_HOTKEY}" \
+  --local-dataset /root/teutonic/s1-work/dataset/manifest.json \
+  --n-public 500 \
+  --batch-size 4 \
+  --gpus 0 \
+  --report-out /root/teutonic/s1-work/verdict.json
+
+
+  export LOCAL_KING_DIR="/root/teutonic/s1-work/king1"
+export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
+export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
+export TRANSFORMERS_TRUST_REMOTE_CODE=true
+
+python -u scripts/mining/train_challenger.py \
+  --work /root/teutonic/s1-work \
+  --bundle /root/teutonic/scripts/training_bundle \
+  --dataset-mode local \
+  --local-dataset-manifest /root/teutonic/s1-work/dataset/manifest.json \
+  --candidate-preset strong_followup \
+  --n-score 64000 \
+  --hard-frac 0.35 \
+  --max-iters 1 \
+  --n-gpus 1 --micro-batch 1 --grad-accum 16 \
+  --report-out /root/teutonic/s1-work/verdict.json
+
+  

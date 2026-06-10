@@ -53,6 +53,25 @@ def patch_transformers_quasar_compat() -> None:
             _mod.create_causal_mask = _compat_create_causal_mask
 
 
+def prepare_quasar_model(model) -> int:
+    """Disable causal-conv1d CUDA kernels that fail on some Quasar weight layouts.
+
+    Bundled ``modeling_qwen3_5.py`` calls ``causal_conv1d_fn`` with
+    ``conv1d.weight.squeeze(1)`` views that can trip
+    ``Cannot access data pointer of Tensor that doesn't have storage`` on
+    torch 2.12 + cu130. The model already has a PyTorch conv fallback when
+    ``causal_conv1d_fn`` is None.
+    """
+    n = 0
+    for module in model.modules():
+        if getattr(module, "causal_conv1d_fn", None) is not None:
+            module.causal_conv1d_fn = None
+            n += 1
+        if getattr(module, "causal_conv1d_update", None) is not None:
+            module.causal_conv1d_update = None
+    return n
+
+
 def hf_remote_code_kwargs(model_path: str) -> dict:
     """Return from_pretrained kwargs for kings that ship local Python modules."""
     p = Path(model_path).expanduser().resolve()
@@ -70,6 +89,34 @@ def hf_remote_code_kwargs(model_path: str) -> dict:
     if s not in sys.path:
         sys.path.insert(0, s)
     return {"trust_remote_code": True}
+
+
+_QUASAR_LORA_TARGETS = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+)
+
+
+def default_lora_target_modules_for_king(model_path: str) -> str | None:
+    """Comma-separated LoRA suffixes for kings with bundled Quasar/hybrid layers."""
+    cfg_path = Path(model_path).expanduser() / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    model_type = str(cfg.get("model_type", ""))
+    archs = cfg.get("architectures") or []
+    layer_types = cfg.get("layer_types") or []
+    if (
+        model_type in ("quasar", "quasar_text")
+        or any("Quasar" in str(a) for a in archs)
+        or "linear_attention" in layer_types
+    ):
+        return ",".join(_QUASAR_LORA_TARGETS)
+    return None
 
 
 def king_subprocess_env(model_path: str, env: dict | None = None) -> dict:

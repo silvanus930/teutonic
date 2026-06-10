@@ -37,7 +37,12 @@ from peft import LoraConfig, PeftModel, get_peft_model
 _mining = Path(__file__).resolve().parents[1] / "mining"
 if str(_mining) not in sys.path:
     sys.path.insert(0, str(_mining))
-from hf_king_compat import hf_remote_code_kwargs, patch_transformers_quasar_compat  # noqa: E402
+from hf_king_compat import (  # noqa: E402
+    default_lora_target_modules_for_king,
+    hf_remote_code_kwargs,
+    patch_transformers_quasar_compat,
+    prepare_quasar_model,
+)
 
 patch_transformers_quasar_compat()
 
@@ -127,7 +132,17 @@ def extract_checkpoint_evals(output_dir: Path) -> dict[str, float]:
     Returns {checkpoint_dir_str: best_eval_loss}. No re-inference."""
     state_path = output_dir / "trainer_state.json"
     if not state_path.is_file():
-        return {}
+        ckpts = sorted(
+            output_dir.glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        for ckpt in reversed(ckpts):
+            candidate = ckpt / "trainer_state.json"
+            if candidate.is_file():
+                state_path = candidate
+                break
+        else:
+            return {}
     try:
         state = json.loads(state_path.read_text())
     except Exception:
@@ -206,6 +221,7 @@ def eval_adapter_val_loss(
     base = AutoModelForCausalLM.from_pretrained(
         base_model, torch_dtype=dtype, use_safetensors=True, **_king_kw,
     )
+    prepare_quasar_model(base)
     model = PeftModel.from_pretrained(base, str(adapter_dir)).to(device)
     model.eval()
 
@@ -326,21 +342,49 @@ def main() -> None:
         use_safetensors=True,
         **_king_kw,
     )
+    n_quasar = prepare_quasar_model(model)
+    if is_main and n_quasar:
+        print(f"[train_lora] quasar compat: PyTorch conv fallback on {n_quasar} layer(s)")
     model.config.use_cache = False
 
-    # Standard Qwen3 FFN modules: gate_proj / up_proj / down_proj.
-    # If your king is Quasar (BigMac MoE), pass:
-    #   --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate,up,down,w_down_proj,w_up_proj
+    lora_targets = args.lora_target_modules or default_lora_target_modules_for_king(
+        args.base_model,
+    )
     target_modules = (
-        args.lora_target_modules.split(",") if args.lora_target_modules
+        lora_targets.split(",") if lora_targets
         else ["q_proj", "k_proj", "v_proj", "o_proj",
               "gate_proj", "up_proj", "down_proj"]
     )
+    if is_main:
+        print(f"[lora] target_modules={target_modules}")
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
         bias="none", task_type="CAUSAL_LM", target_modules=target_modules,
     )
-    model = get_peft_model(model, lora_cfg)
+    resume = (args.resume_from_checkpoint or "").strip()
+    resume_ckpt: str | None = None
+    adapter_resume: str | None = None
+    if resume:
+        resume_p = Path(resume)
+        if (resume_p / "trainer_state.json").is_file():
+            resume_ckpt = str(resume_p)
+        elif (resume_p / "adapter_model.safetensors").is_file() or \
+                (resume_p / "adapter_model.bin").is_file():
+            adapter_resume = str(resume_p)
+        elif is_main:
+            raise FileNotFoundError(
+                f"--resume-from-checkpoint {resume} has no trainer_state.json "
+                "or adapter weights"
+            )
+
+    if adapter_resume:
+        model = PeftModel.from_pretrained(
+            model, adapter_resume, is_trainable=True,
+        )
+        if is_main:
+            print(f"[lora] loaded adapter weights from {adapter_resume}")
+    else:
+        model = get_peft_model(model, lora_cfg)
     if is_main:
         model.print_trainable_parameters()
 
@@ -439,8 +483,7 @@ def main() -> None:
         optimizers=optimizers,
     )
 
-    resume = (args.resume_from_checkpoint or "").strip()
-    trainer.train(resume_from_checkpoint=resume if resume else None)
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # ============================================================
     # POST-TRAINING: checkpoint selection + optional averaging
@@ -518,10 +561,17 @@ def main() -> None:
             print(f"[ckpt] best_adapter <- averaged ({final_adapter_dir})")
         else:
             averaged_is_better = False
-            # trainer.save_model() saves the PEFT adapter; safe to call rank-0-only
-            # after training ends (no active DDP barriers).
-            trainer.save_model(str(final_adapter_dir))
-            print(f"[ckpt] best_adapter <- trainer best ({final_adapter_dir})")
+            if best_single_dir and best_single_dir.is_dir():
+                if final_adapter_dir.exists():
+                    shutil.rmtree(final_adapter_dir)
+                shutil.copytree(str(best_single_dir), str(final_adapter_dir))
+                print(
+                    f"[ckpt] best_adapter <- {best_single_dir.name} "
+                    f"(eval_loss={best_single_loss:.4f})"
+                )
+            else:
+                trainer.save_model(str(final_adapter_dir))
+                print(f"[ckpt] best_adapter <- final trainer state ({final_adapter_dir})")
 
         tokenizer.save_pretrained(str(final_adapter_dir))
 

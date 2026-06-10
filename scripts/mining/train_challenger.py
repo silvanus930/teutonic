@@ -58,7 +58,9 @@ _mining_dir = os.path.dirname(os.path.abspath(__file__))
 if _mining_dir not in sys.path:
     sys.path.insert(0, _mining_dir)
 from hf_king_compat import (  # noqa: E402
+    default_lora_target_modules_for_king,
     hf_remote_code_kwargs as _hf_remote_code_kwargs,
+    prepare_quasar_model as _prepare_quasar_model,
     king_subprocess_env,
     patch_transformers_quasar_compat,
 )
@@ -490,7 +492,7 @@ def manifest_hash(manifest: dict) -> str:
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def compute_per_seq_loss(model, token_batches, device, chunk=LM_HEAD_CHUNK):
-    input_ids = torch.tensor(token_batches, dtype=torch.long, device=device)
+    input_ids = torch.tensor(token_batches, dtype=torch.long, device=device).contiguous()
     if hasattr(model, "reset_state"):
         model.reset_state()
     out = model.model(input_ids)
@@ -526,12 +528,14 @@ def paired_eval(
         king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
         use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
     )
+    _prepare_quasar_model(king)
     king.eval()
     log.info("paired_eval: loading challenger %s", chall_dir)
     chall = AutoModelForCausalLM.from_pretrained(
         chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
         use_safetensors=True, **_hf_remote_code_kwargs(chall_dir),
     )
+    _prepare_quasar_model(chall)
     chall.eval()
 
     diffs = []
@@ -778,6 +782,9 @@ def score_and_curate(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
             use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
         )
+        n_quasar = _prepare_quasar_model(model)
+        if n_quasar:
+            log.info("quasar compat: using PyTorch conv fallback on %d layer(s)", n_quasar)
         model.eval()
 
         rows: list[dict] = []
@@ -1029,6 +1036,7 @@ def run_lora_training(
     out_dir: Path, n_gpus: int, args: argparse.Namespace,
     bundle: Path,
     resume_checkpoint: str = "",
+    learning_rate: float | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -1041,7 +1049,7 @@ def run_lora_training(
         "--seq-len", str(args.seq_len),
         "--micro-batch-size", str(args.micro_batch),
         "--grad-accum", str(args.grad_accum),
-        "--learning-rate", str(args.lr),
+        "--learning-rate", str(learning_rate if learning_rate is not None else args.lr),
         "--epochs", str(args.epochs),
         "--lora-r", str(args.lora_r),
         "--lora-alpha", str(args.lora_alpha),
@@ -1060,6 +1068,8 @@ def run_lora_training(
         "--lr-scheduler-type", args.lr_scheduler_type,
         "--average-top-k-lora-checkpoints", str(args.average_top_k_lora_checkpoints),
     ]
+    if args.lora_target_modules:
+        cmd.extend(["--lora-target-modules", args.lora_target_modules])
     if args.gradient_checkpointing:
         cmd.append("--gradient-checkpointing")
     else:
@@ -1094,6 +1104,7 @@ def merge_lora(
         base_model, torch_dtype=torch.bfloat16, use_safetensors=True,
         **_hf_remote_code_kwargs(base_model),
     )
+    _prepare_quasar_model(base)
     merged = PeftModel.from_pretrained(base, str(adapter)).merge_and_unload()
     out.mkdir(parents=True, exist_ok=True)
     save_kw: dict = {"safe_serialization": True}
@@ -1356,6 +1367,9 @@ def main():
     ap.add_argument("--lora-r", type=int, default=None)
     ap.add_argument("--lora-alpha", type=int, default=None)
     ap.add_argument("--lora-dropout", type=float, default=None)
+    ap.add_argument("--lora-target-modules", default=None,
+                    help="Comma-separated LoRA module suffixes. "
+                         "Auto-detected for Quasar kings when omitted.")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--warmup-ratio", type=float, default=None,
                     help="Warmup fraction of total steps. Default from preset or 0.03.")
@@ -1395,6 +1409,9 @@ def main():
                     help="LoRA adapter dir to resume training from (overrides auto-chain).")
     ap.add_argument("--no-chain-lora", action="store_true",
                     help="Do not resume iter N>0 from iter_{N-1}/lora/best_adapter.")
+    ap.add_argument("--chain-lr-ratio", type=float, default=0.25,
+                    help="When chaining from adapter-only checkpoint (no trainer_state), "
+                         "multiply base --lr by this ratio for follow-up iters.")
     ap.add_argument("--from-iter", type=int, default=-1)
     ap.add_argument("--skip-scoring", action="store_true")
     ap.add_argument("--force", action="store_true",
@@ -1508,6 +1525,18 @@ def main():
     if args.local_dataset_manifest:
         os.environ["LOCAL_DATASET_MANIFEST"] = args.local_dataset_manifest
 
+    local_manifest = (
+        args.local_dataset_manifest or os.environ.get("LOCAL_DATASET_MANIFEST", "")
+    ).strip()
+    if args.dataset_mode in ("local", "pretokenized"):
+        if not local_manifest or not Path(local_manifest).is_file():
+            raise SystemExit(
+                "ERROR: --dataset-mode local requires king-tokenized shards.\n"
+                "  Pass an explicit path (do not rely on an unset env var):\n"
+                "    --local-dataset-manifest /root/teutonic/s1-work/dataset/manifest.json\n"
+                "  Or export LOCAL_DATASET_MANIFEST to that path before running."
+            )
+
     # --- sanity checks ---
     if args.n_score > 0:
         min_score = args.train_per_iter + args.val_size
@@ -1529,13 +1558,19 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. King ----
-    king = fetch_king()
     work_king_dir = work / "king"
     local_king = os.environ.get("LOCAL_KING_DIR", "")
     if local_king:
         local_king_p = Path(local_king)
         if not local_king_p.exists():
             raise FileNotFoundError(f"LOCAL_KING_DIR not found: {local_king_p}")
+        king = {
+            "hf_repo": str(local_king_p.resolve()),
+            "king_revision": "local",
+            "hotkey": "local",
+            "reign_number": 0,
+        }
+        log.info("LOCAL_KING_DIR set — skipping dashboard fetch")
         # Use the pointed king directory in-place (avoid copying / overwriting).
         king_dir = local_king_p.resolve()
         if king_dir == work_king_dir.resolve():
@@ -1545,6 +1580,7 @@ def main():
             )
         log.info("using LOCAL_KING_DIR in-place: %s", king_dir)
     else:
+        king = fetch_king()
         king_dir = work_king_dir
         if king_dir.exists():
             shutil.rmtree(king_dir)
@@ -1564,6 +1600,11 @@ def main():
 
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
+    if not args.lora_target_modules:
+        auto_lora = default_lora_target_modules_for_king(str(king_dir))
+        if auto_lora:
+            args.lora_target_modules = auto_lora
+            log.info("auto lora targets (Quasar): %s", auto_lora)
     vocab_size = king_vocab_size(king_dir)
 
     # ---- 2. Dataset ----
@@ -1842,6 +1883,7 @@ def main():
                 adapter = cks[-1]
         else:
             resume = (args.resume_checkpoint or "").strip()
+            chain_lr: float | None = None
             if not resume and not args.no_chain_lora and it > 0:
                 prev_adapter = work / f"iter_{it-1:02d}" / "lora" / "best_adapter"
                 if prev_adapter.is_dir():
@@ -1849,10 +1891,29 @@ def main():
                     log.info("chaining LoRA from iter_%02d: %s", it - 1, resume)
             elif resume:
                 log.info("resuming LoRA from %s", resume)
+            if resume and it > 0:
+                resume_p = Path(resume)
+                adapter_only = (
+                    (resume_p / "adapter_model.safetensors").is_file()
+                    or (resume_p / "adapter_model.bin").is_file()
+                ) and not (resume_p / "trainer_state.json").is_file()
+                if adapter_only:
+                    chain_lr = args.lr * args.chain_lr_ratio
+                    log.info(
+                        "chain training: adapter-only resume, lr=%g (base %g × ratio %g)",
+                        chain_lr, args.lr, args.chain_lr_ratio,
+                    )
+            if args.skip_scoring and it > 0 and train_p.exists():
+                log.warning(
+                    "iter %d: --skip-scoring reuses prior curriculum; "
+                    "re-score with higher --hard-frac for better raw Hippius gains",
+                    it,
+                )
             adapter = run_lora_training(
                 str(king_dir), train_p, val_p, out_dir,
                 args.n_gpus, args, Path(args.bundle),
                 resume_checkpoint=resume,
+                learning_rate=chain_lr,
             )
 
         # --- Merge ---

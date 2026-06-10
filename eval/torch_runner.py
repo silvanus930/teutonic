@@ -67,6 +67,24 @@ from model_store import ModelRef, materialize_model  # noqa: E402
 log = logging.getLogger("eval_torch")
 
 
+def _mining_hf_king_compat():
+    """Lazy import of king load helpers (Quasar bundled modeling_qwen3_5.py)."""
+    mining = os.path.join(_workspace_root, "scripts", "mining")
+    if mining not in sys.path:
+        sys.path.insert(0, mining)
+    from hf_king_compat import (  # noqa: WPS433
+        hf_remote_code_kwargs,
+        patch_transformers_quasar_compat,
+        prepare_quasar_model,
+    )
+    patch_transformers_quasar_compat()
+    return hf_remote_code_kwargs, prepare_quasar_model
+
+
+def _is_local_model_path(repo: str) -> bool:
+    return os.path.isdir(os.path.expanduser(repo))
+
+
 # ---------------------------------------------------------------------------
 # R2 client
 # ---------------------------------------------------------------------------
@@ -584,9 +602,12 @@ def load_model(repo, device, label="model", force_download=False, revision=None,
     log.info("loading %s from %s onto %s (force_download=%s, digest=%s)",
              label, repo, target, force_download, revision[:19] if revision else None)
     t0 = time.time()
+    hf_remote_code_kwargs, prepare_quasar_model = _mining_hf_king_compat()
+    king_kw = hf_remote_code_kwargs(str(repo)) if _is_local_model_path(str(repo)) else {}
+
     # Pre-download with hard timeout so a stuck CDN doesn't hang the eval lock
     # for half an hour. Skip on force_download (let from_pretrained re-pull).
-    if not force_download:
+    if not force_download and not _is_local_model_path(str(repo)):
         try:
             _prefetch_repo(repo, digest=revision,
                            timeout=int(os.environ.get("HIPPIUS_PREFETCH_TIMEOUT", "600")))
@@ -615,7 +636,11 @@ def load_model(repo, device, label="model", force_download=False, revision=None,
                 force_download=False,
                 use_safetensors=True,
                 **load_kwargs,
+                **king_kw,
             )
+            n_quasar = prepare_quasar_model(model)
+            if n_quasar:
+                log.info("quasar compat: PyTorch conv fallback on %d layer(s)", n_quasar)
             log.info("using attn_implementation=%s", attn_impl)
             break
         except Exception as e:
