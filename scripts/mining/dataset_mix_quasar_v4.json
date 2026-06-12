@@ -1,0 +1,26 @@
+{
+  "seq_len": 2048,
+  "hippius_base": "https://s3.hippius.com/teutonic-sn3",
+  "datasets": [
+    {
+      "name": "automathtext-v2",
+      "manifest_url": "https://eu-central-1.hippius.com/teutonic-sn3/dataset/automathtext-v2-quasar-10b/manifest.json",
+      "weight": 0.35
+    },
+    {
+      "name": "quasar-sn3",
+      "manifest_url": "https://us-east-1.hippius.com/teutonic-sn3/dataset/quasar-sn3-retok/manifest.json",
+      "weight": 0.05
+    },
+    {
+      "name": "ultradata-math",
+      "manifest_url": "https://us-east-1.hippius.com/teutonic-sn3/dataset/ultradata-math-quasar-10b/manifest.json",
+      "weight": 0.35
+    },
+    {
+      "name": "finewebedu",
+      "manifest_url": "https://eu-central-1.hippius.com/teutonic-sn3/dataset/finewebedu/manifest.json",
+      "weight": 0.25
+    }
+  ]
+}

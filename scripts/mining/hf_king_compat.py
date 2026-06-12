@@ -72,18 +72,63 @@ def prepare_quasar_model(model) -> int:
     return n
 
 
+def _is_quasar_king_dir(model_path: Path) -> bool:
+    cfg_path = model_path / "config.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    model_type = str(cfg.get("model_type", ""))
+    archs = cfg.get("architectures") or []
+    layer_types = cfg.get("layer_types") or []
+    return (
+        model_type in ("quasar", "quasar_text")
+        or any("Quasar" in str(a) for a in archs)
+        or "linear_attention" in layer_types
+    )
+
+
+def ensure_quasar_runtime_deps(model_path: str = "") -> None:
+    """Quasar kings with bundled modeling_qwen3_5.py need fla + causal-conv1d."""
+    p = Path(model_path).expanduser().resolve() if model_path else None
+    if p and p.is_dir():
+        has_custom = any((p / n).is_file() for n in (
+            "configuration_qwen3_5.py", "modeling_qwen3_5.py",
+        ))
+        if not has_custom:
+            return
+    elif p and p.is_dir() and not _is_quasar_king_dir(p):
+        return
+    missing: list[str] = []
+    try:
+        import causal_conv1d  # noqa: F401
+    except ImportError:
+        missing.append("causal-conv1d")
+    try:
+        import fla  # noqa: F401
+    except ImportError:
+        missing.append("flash-linear-attention (fla)")
+    if not missing:
+        return
+    raise ImportError(
+        "Quasar king load requires: " + ", ".join(missing) + ".\n"
+        "See scripts/mining/requirements.txt for install commands."
+    )
+
+
 def hf_remote_code_kwargs(model_path: str) -> dict:
     """Return from_pretrained kwargs for kings that ship local Python modules."""
     p = Path(model_path).expanduser().resolve()
     if not p.is_dir():
         return {}
-    # Merged challengers may copy auto_map in config.json without shipping *.py;
-    # only enable remote code when the modeling files are actually present.
     has_custom = any((p / name).is_file() for name in (
         "configuration_qwen3_5.py", "modeling_qwen3_5.py",
     ))
     if not has_custom:
         return {}
+    ensure_quasar_runtime_deps(str(p))
     patch_transformers_quasar_compat()
     s = str(p)
     if s not in sys.path:
@@ -127,6 +172,7 @@ def king_subprocess_env(model_path: str, env: dict | None = None) -> dict:
         return out
     patch_transformers_quasar_compat()
     if any((p / n).is_file() for n in ("configuration_qwen3_5.py", "modeling_qwen3_5.py")):
+        ensure_quasar_runtime_deps(str(p))
         prev = out.get("PYTHONPATH", "")
         s = str(p)
         out["PYTHONPATH"] = f"{s}:{prev}" if prev else s

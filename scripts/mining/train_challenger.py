@@ -57,8 +57,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 _mining_dir = os.path.dirname(os.path.abspath(__file__))
 if _mining_dir not in sys.path:
     sys.path.insert(0, _mining_dir)
+from dataset_mix import (  # noqa: E402
+    MixConfig,
+    MixedDatasetIndex,
+    ShardStore,
+    load_mix_config,
+    mix_config_hash,
+    refs_to_candidates,
+    synthetic_manifest,
+)
 from hf_king_compat import (  # noqa: E402
     default_lora_target_modules_for_king,
+    ensure_quasar_arch_registered,
     hf_remote_code_kwargs as _hf_remote_code_kwargs,
     prepare_quasar_model as _prepare_quasar_model,
     king_subprocess_env,
@@ -66,6 +76,7 @@ from hf_king_compat import (  # noqa: E402
 )
 
 patch_transformers_quasar_compat()
+ensure_quasar_arch_registered()
 
 _repo_root = os.path.dirname(os.path.dirname(_mining_dir))
 if _repo_root not in sys.path:
@@ -92,7 +103,9 @@ DASHBOARD_URL = os.environ.get(
     "TEUTONIC_DASHBOARD_URL",
     "https://us-east-1.hippius.com/teutonic-sn3/dashboard.json",
 )
-HIPPIUS_BASE = "https://s3.hippius.com/teutonic-sn3"
+HIPPIUS_BASE = os.environ.get(
+    "TEUTONIC_HIPPIUS_HTTP_BASE", "https://s3.hippius.com/teutonic-sn3",
+).rstrip("/")
 
 # Candidate training presets
 # Keys with value None = not set (use CLI default).
@@ -275,9 +288,11 @@ def pretokenized_incompatible_with_king(manifest: dict, king_dir: Path) -> bool:
     shard_tok = (
         manifest.get("tokenizer") or manifest.get("tokenizer_dir") or ""
     ).lower()
+    if "quasar" in shard_tok:
+        return False
     cfg = json.loads((king_dir / "config.json").read_text())
     arch = " ".join(cfg.get("architectures") or []).lower()
-    if "qwen" not in arch:
+    if "qwen" not in arch and "quasar" not in arch:
         return False
     return "gemma" in shard_tok or "unsloth" in shard_tok
 
@@ -739,6 +754,7 @@ def score_and_curate(
     score_cache_path: Path | None = None,
     force_rescore: bool = False,
     king_hash: str = "",
+    preset_cands: list[tuple[int, int]] | None = None,
 ) -> tuple[Path, Path]:
     """Score n_score random samples on the king, build curriculum, write train/val jsonl.
 
@@ -753,8 +769,12 @@ def score_and_curate(
     assert len(shard_keys) == len(shards), \
         f"shard_keys length {len(shard_keys)} != shards length {len(shards)}"
     rng = np.random.default_rng(seed)
-    cands = global_sample_shard_indices(shards, n_score, rng)
-    rng.shuffle(cands)
+    if preset_cands is not None:
+        cands = list(preset_cands)
+        rng.shuffle(cands)
+    else:
+        cands = global_sample_shard_indices(shards, n_score, rng)
+        rng.shuffle(cands)
     # shard_keys for the actually sampled shards (unique local indices)
     sampled_local_idxs = sorted({s for s, _ in cands})
     sampled_keys = [shard_keys[i] for i in sampled_local_idxs]
@@ -1274,6 +1294,20 @@ def main():
         "--local-dataset-manifest", default="",
         help="Path to local manifest.json (overrides LOCAL_DATASET_MANIFEST env var)",
     )
+    ap.add_argument(
+        "--dataset-mix", default="",
+        help="JSON with multiple v4 Hippius manifests + weights "
+             "(see scripts/mining/dataset_mix_quasar_v4.json). "
+             "Overrides --dataset-mode / --local-dataset-manifest.",
+    )
+    ap.add_argument(
+        "--mix-shard-cache", default="",
+        help="Cache dir for mixed-mode shard downloads (default: <work>/mix_cache)",
+    )
+    ap.add_argument(
+        "--mix-shards-per-dataset", type=int, default=12,
+        help="Mixed mode: shard pool per dataset (only these .npy files download).",
+    )
     ap.add_argument("--n-shards", type=int, default=0)
     ap.add_argument("--shard-start", type=int, default=0)
     ap.add_argument("--raw-max-files", type=int, default=RAW_MAX_FILES)
@@ -1550,7 +1584,6 @@ def main():
 
     if args.eval_mode == "validator":
         os.environ.setdefault("TEUTONIC_EVAL_DATASET_MODE", "raw_hippius")
-        os.environ.setdefault("TEUTONIC_RAW_TOKENIZER_REPO", "Qwen/Qwen3-4B")
 
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
@@ -1600,6 +1633,12 @@ def main():
 
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
+    if args.eval_mode == "validator":
+        os.environ.setdefault("TEUTONIC_RAW_TOKENIZER_REPO", str(king_dir))
+        log.info(
+            "validator eval tokenizer: %s",
+            os.environ["TEUTONIC_RAW_TOKENIZER_REPO"],
+        )
     if not args.lora_target_modules:
         auto_lora = default_lora_target_modules_for_king(str(king_dir))
         if auto_lora:
@@ -1614,6 +1653,13 @@ def main():
     eval_arr_per_shard: list[np.ndarray] = []
     eval_indices: list[int] | None = None
     manifest: dict = {}
+    mix_cfg: MixConfig | None = None
+    mix_index: MixedDatasetIndex | None = None
+    mix_cache_dir: Path | None = None
+
+    dataset_mix = (
+        args.dataset_mix or os.environ.get("TEUTONIC_DATASET_MIX", "")
+    ).strip()
 
     skip_shard_load = (
         (args.skip_scoring or args.from_iter >= 0) and args.eval_mode == "validator"
@@ -1621,13 +1667,23 @@ def main():
 
     if skip_shard_load:
         log.info("skipping dataset shard load (skip_scoring/from_iter + validator eval)")
+    elif dataset_mix:
+        mix_cfg = load_mix_config(dataset_mix)
+        mix_cache_dir = Path(args.mix_shard_cache or work / "mix_cache")
+        mix_index = MixedDatasetIndex(mix_cfg, mix_cache_dir)
+        manifest = synthetic_manifest(mix_cfg)
+        log.info(
+            "dataset mode: mixed-v4 (%d sources, weights=%s)",
+            len(mix_cfg.datasets),
+            ", ".join(f"{d.name}={d.weight:.2f}" for d in mix_cfg.datasets),
+        )
     else:
         manifest = fetch_manifest(cache, args.local_dataset_manifest)
         dataset_mode = resolve_dataset_mode(args.dataset_mode, manifest, king_dir)
         log.info("dataset mode: %s (manifest tokenizer=%r, king vocab=%s)",
                  dataset_mode, manifest.get("tokenizer"), vocab_size)
 
-        if dataset_mode == "raw":
+        if dataset_mode == "raw" and not mix_index:
             n_needed = args.n_score + args.train_per_iter + args.val_size + 256
             if args.n_score == 0:
                 n_needed = args.train_per_iter + args.val_size + 256
@@ -1668,7 +1724,7 @@ def main():
                 eval_indices = rng_eval.choice(
                     len(eval_arr), size=min(args.n_eval, len(eval_arr)), replace=False,
                 ).tolist()
-        else:
+        elif not mix_index:
             # pretokenized / local
             # Use structured train_shards / eval_shards split if available (new-format manifests).
             # Fall back to legacy combined shards + eval_shard index for backward compat.
@@ -1791,6 +1847,11 @@ def main():
     if args.use_local_score_cache:
         if args.score_cache_dir:
             score_cache_dir = Path(args.score_cache_dir) / f"king_{king_hash[:16]}"
+        elif mix_cfg is not None:
+            score_cache_dir = (
+                work / "score_cache" / f"king_{king_hash[:16]}"
+                / f"mix_{mix_config_hash(mix_cfg)[:8]}"
+            )
         else:
             score_cache_dir = _score_cache_dir(work, king_hash, manifest)
         score_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1844,8 +1905,10 @@ def main():
                     f"--skip-scoring set but {train_p} or {val_p} missing"
                 )
             if args.n_score == 0:
-                # First-strike / direct sampling: no king forward pass, no loss buckets.
-                # Clean random sampling with token-level quality filters only.
+                if mix_index is not None:
+                    raise RuntimeError(
+                        "n_score=0 is not supported with --dataset-mix; use n_score > 0"
+                    )
                 if not shards:
                     raise RuntimeError(
                         "n_score=0 (direct sampling) requires local shards. "
@@ -1855,8 +1918,29 @@ def main():
                     shards, args.train_per_iter, args.val_size, seed, iter_work,
                 )
             else:
+                preset_cands: list[tuple[int, int]] | None = None
+                iter_shards = shards
+                iter_keys = shard_keys
+                if mix_index is not None and mix_cfg is not None and mix_cache_dir:
+                    refs, _ = mix_index.sample_refs(
+                        args.n_score, seed, args.mix_shards_per_dataset,
+                    )
+                    store = ShardStore(
+                        mix_cache_dir, mix_cfg.hippius_base, mix_cfg.seq_len,
+                    )
+                    preset_cands = refs_to_candidates(refs, store)
+                    iter_shards = store.arrays
+                    iter_keys = store.keys
+                    for key, arr in zip(iter_keys, iter_shards):
+                        validate_sequences_vocab(arr, vocab_size, key)
+                    log.info(
+                        "mixed scoring: %d candidates, %d shard file(s) "
+                        "(pool=%d/dataset)",
+                        len(preset_cands), len(iter_keys),
+                        args.mix_shards_per_dataset,
+                    )
                 train_p, val_p = score_and_curate(
-                    str(king_dir), shards, shard_keys, manifest,
+                    str(king_dir), iter_shards, iter_keys, manifest,
                     args.n_score, args.train_per_iter, args.val_size,
                     seed, "cuda:0", iter_work,
                     general_frac=args.general_frac,
@@ -1866,6 +1950,7 @@ def main():
                     score_cache_path=score_cache_dir,
                     force_rescore=args.force_rescore,
                     king_hash=king_hash,
+                    preset_cands=preset_cands,
                 )
 
         # --- Train ---

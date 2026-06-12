@@ -11,26 +11,19 @@
 
 set -euo pipefail
 
-REPO="dendrite/teutonic-5gbdp8ba-test-dv00s"
-REV="main"
-OUT_DIR="${OUT_DIR:-/root/teutonic/models/teutonic-5gbdp8ba-test-dv00s}"
+REPO="mastertensor/teutonic-q3-10b-5ek5koe5-41021132322-rn"
+REV="5Ek5KoE5-41021132322-rn"
+OUT_DIR="${OUT_DIR:-/root/teutonic/s1-work/king1}"
 
 FILES=(
-  model-00001-of-00009.safetensors
-  model-00002-of-00009.safetensors
-  model-00003-of-00009.safetensors
-  model-00004-of-00009.safetensors
-  model-00005-of-00009.safetensors
-  model-00006-of-00009.safetensors
-  model-00007-of-00009.safetensors
-  model-00008-of-00009.safetensors
-  model-00009-of-00009.safetensors
+  model-00001-of-00004.safetensors
+  model-00002-of-00004.safetensors
+  model-00003-of-00004.safetensors
+  model-00004-of-00004.safetensors
   model.safetensors.index.json
-  tokenizer.json
   modeling_qwen3_5.py
   configuration_qwen3_5.py
   config.json
-  tokenizer_config.json
   generation_config.json
 )
 
