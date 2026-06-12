@@ -446,9 +446,10 @@ python -u scripts/mining/train_challenger.py \
   --dataset-mix /root/teutonic/scripts/mining/dataset_mix_quasar_v4.json \
   --mix-shards-per-dataset 12 \
   --candidate-preset strong_followup \
-  --n-score 32000 \
-  --train-per-iter 20000 \
+  --n-score 15000 \
+  --train-per-iter 1000 \
   --val-size 1500 \
+  --skip-scoring \
   --hard-frac 0.35 \
   --general-frac 0.55 \
   --easy-frac 0.10 \

@@ -18,7 +18,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-5ev4mnnc-011 /root/teutonic/s1-work/iter_00/merged --revision main
+hippius-hub upload yoko/teutonic-5ev4mnnc-012 /root/teutonic/s1-work/iter_00/merged --revision main
 hf download silvanus0930/Teutonic-Q3-8B-Test /root/teutonic/s1-work/merged
 
 hf download "silvanus0930/Teutonic-Q3-8B-Test" --local-dir "/root/teutonic/s1-work/merged"
@@ -44,20 +44,17 @@ local_dir = snapshot_download(
 print(local_dir)
 EOF
 
-REPO="mastertensor/teutonic-q3-10b-5ek5koe5-78819105797-rn"
-REV="5Ek5KoE5-78819105797-rn"
+REPO="mastertensor/teutonic-q3-10b-5ek5koe5-40037154544-rn"
+REV="5Ek5KoE5-40037154544-rn"
 
 for f in \
-  model-00001-of-00005.safetensors \
-  model-00002-of-00005.safetensors \
-  model-00003-of-00005.safetensors \
-  model-00004-of-00005.safetensors \
-  model-00005-of-00005.safetensors \
+  model-00001-of-00004.safetensors \
+  model-00002-of-00004.safetensors \
+  model-00003-of-00004.safetensors \
+  model-00004-of-00004.safetensors \
   modeling_qwen3_5.py \
   configuration_qwen3_5.py \
-  tokenizer.json \
   model.safetensors.index.json \
-  tokenizer_config.json \
   config.json \
   generation_config.json
 do
@@ -67,7 +64,7 @@ done
 
 tech-dev-ai/Teutonic-VIII-5CXiauzN-cru1
 
-cp -avL /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-78819105797-rn/snapshots/5Ek5KoE5-78819105797-rn /root/teutonic/s1-work
+cp -avL /root/.cache/hippius/hub/models--kyou--teutonic-5g1dh3iz-test119/snapshots/test119 /root/teutonic/s1-work
 
 python submit_challenger.py \
   --verdict /root/teutonic/s1-work/verdict.json \
@@ -169,10 +166,10 @@ Skips ~18 min scoring and does **not** reload 4×2G shards.
 hippius-hub upload yoko/teutonic-5ev4mnnc-006 /root/teutonic/s1-work/merged123 --revision main
 
 python scripts/mining/submit_challenger.py \
-  --uploaded-repo yoko/teutonic-5ev4mnnc-006 \
+  --uploaded-repo yoko/teutonic-5ev4mnnc-012 \
   --uploaded-digest sha256:06212d910349f515871646347bf4ee8ae9743a8b32b68a45245a139c543578c2 \
   --wallet-name silvanus-hs1 \
-  --hotkey hotkey38 \
+  --hotkey hotkey41 \
   --netuid 3 \
   --network finney
 
@@ -232,4 +229,51 @@ python -u scripts/mining/train_challenger.py \
   --n-gpus 1 --micro-batch 1 --grad-accum 16 \
   --report-out /root/teutonic/s1-work/verdict.json
 
-  
+  cd /root/teutonic
+source .venv/bin/activate
+
+export LOCAL_KING_DIR="/root/teutonic/s1-work/test119"
+export TEUTONIC_SIM_HOTKEY="5GNJfDvtqqAjhwy9knrf9xTAhUu6hdZqwXELuY425Xio8a24"
+export TRANSFORMERS_TRUST_REMOTE_CODE=true
+export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
+export TEUTONIC_RAW_TOKENIZER_REPO="${LOCAL_KING_DIR}"
+unset LOCAL_DATASET_MANIFEST
+
+python -u scripts/mining/validator_eval.py \
+  --king "${LOCAL_KING_DIR}" \
+  --challenger /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-40037154544-rn/snapshots/5Ek5KoE5-40037154544-rn \
+  --hotkey "${TEUTONIC_SIM_HOTKEY}" \
+  --n-public 500 \
+  --batch-size 8 \
+  --gpus 0 \
+  --report-out /root/teutonic/s1-work/verdict.json
+
+
+  cd /root/teutonic && source .venv/bin/activate
+
+export LOCAL_KING_DIR="/root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-40037154544-rn/snapshots/5Ek5KoE5-40037154544-rn"
+export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
+export TRANSFORMERS_TRUST_REMOTE_CODE=true
+
+python -u scripts/mining/train_challenger.py \
+  --work /root/teutonic/s1-work \
+  --bundle /root/teutonic/scripts/training_bundle \
+  --dataset-mix /root/teutonic/scripts/mining/dataset_mix_quasar_v4.json \
+  --mix-shards-per-dataset 12 \
+  --candidate-preset strong_followup \
+  --n-score 5000 \
+  --train-per-iter 4000 \
+  --val-size 400 \
+  --hard-frac 0.35 \
+  --general-frac 0.55 \
+  --easy-frac 0.10 \
+  --epochs 1.5 \
+  --lr 5e-5 \
+  --max-iters 1 \
+  --n-gpus 1 \
+  --micro-batch 1 \
+  --grad-accum 16 \
+  --eval-mode validator \
+  --final-eval-n 1000 \
+  --n-eval 1000 \
+  --report-out /root/teutonic/s1-work/verdict.json
