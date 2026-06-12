@@ -1612,6 +1612,13 @@ def main():
                 f"{work / 'king1'} to avoid symlink loops with hf download)"
             )
         log.info("using LOCAL_KING_DIR in-place: %s", king_dir)
+        if not (king_dir / "config.json").is_file():
+            hint = work / "king1"
+            raise FileNotFoundError(
+                f"LOCAL_KING_DIR={king_dir} has no config.json (not a model directory).\n"
+                f"  Point LOCAL_KING_DIR at the folder with weights, e.g.:\n"
+                f"    export LOCAL_KING_DIR={hint}"
+            )
     else:
         king = fetch_king()
         king_dir = work_king_dir

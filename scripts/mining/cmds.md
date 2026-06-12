@@ -433,3 +433,32 @@ All preset values can be overridden by explicit CLI args
   race_summary.md         # human-readable summary
   verdict.json            # final top-level verdict (--report-out)
 ```
+
+cd /root/teutonic && source .venv/bin/activate
+
+export LOCAL_KING_DIR="/root/teutonic/s1-work/king1"
+export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
+export TRANSFORMERS_TRUST_REMOTE_CODE=true
+
+python -u scripts/mining/train_challenger.py \
+  --work /root/teutonic/s1-work \
+  --bundle /root/teutonic/scripts/training_bundle \
+  --dataset-mix /root/teutonic/scripts/mining/dataset_mix_quasar_v4.json \
+  --mix-shards-per-dataset 12 \
+  --candidate-preset strong_followup \
+  --n-score 32000 \
+  --train-per-iter 20000 \
+  --val-size 1500 \
+  --hard-frac 0.35 \
+  --general-frac 0.55 \
+  --easy-frac 0.10 \
+  --epochs 1.5 \
+  --lr 5e-5 \
+  --max-iters 1 \
+  --n-gpus 1 \
+  --micro-batch 2 \
+  --grad-accum 8 \
+  --eval-mode validator \
+  --final-eval-n 1000 \
+  --n-eval 1000 \
+  --report-out /root/teutonic/s1-work/verdict.json
