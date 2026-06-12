@@ -106,6 +106,8 @@ DASHBOARD_URL = os.environ.get(
 HIPPIUS_BASE = os.environ.get(
     "TEUTONIC_HIPPIUS_HTTP_BASE", "https://s3.hippius.com/teutonic-sn3",
 ).rstrip("/")
+# ~4–5 safetensor files for 8.6B Quasar (~17 GB); Hippius-friendly upload size.
+DEFAULT_MERGE_MAX_SHARD_SIZE = "3500MB"
 
 # Candidate training presets
 # Keys with value None = not set (use CLI default).
@@ -1114,7 +1116,7 @@ def run_lora_training(
 
 def merge_lora(
     base_model: str, adapter: Path | str, out: Path | str,
-    max_shard_size: str = "",
+    max_shard_size: str = DEFAULT_MERGE_MAX_SHARD_SIZE,
 ) -> Path:
     adapter = Path(adapter)
     out = Path(out)
@@ -1128,10 +1130,21 @@ def merge_lora(
     merged = PeftModel.from_pretrained(base, str(adapter)).merge_and_unload()
     out.mkdir(parents=True, exist_ok=True)
     save_kw: dict = {"safe_serialization": True}
-    if max_shard_size:
-        save_kw["max_shard_size"] = max_shard_size
-        log.info("merge save: sharding weights max_shard_size=%s", max_shard_size)
+    shard_cap = (max_shard_size or "").strip()
+    if shard_cap:
+        save_kw["max_shard_size"] = shard_cap
+        log.info("merge save: sharding weights max_shard_size=%s", shard_cap)
+    else:
+        log.info("merge save: single model.safetensors (no max_shard_size)")
     merged.save_pretrained(str(out), **save_kw)
+    weight_shards = sorted(out.glob("model-*-of-*.safetensors"))
+    if weight_shards:
+        for p in weight_shards:
+            log.info("merge shard: %s (%.2f GB)", p.name, p.stat().st_size / 1e9)
+        log.info("merge saved %d weight shard(s)", len(weight_shards))
+    elif (out / "model.safetensors").is_file():
+        p = out / "model.safetensors"
+        log.info("merge shard: %s (%.2f GB)", p.name, p.stat().st_size / 1e9)
     tok = AutoTokenizer.from_pretrained(
         base_model, use_fast=True, **_hf_remote_code_kwargs(base_model),
     )
@@ -1459,9 +1472,11 @@ def main():
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--report-out", default="")
     ap.add_argument(
-        "--merge-max-shard-size", default=os.environ.get("TEUTONIC_MERGE_MAX_SHARD_SIZE", ""),
-        help="Shard merged safetensors on save, e.g. 3500MB or 3.5GB (Hippius upload). "
-             "Default: single model.safetensors file.",
+        "--merge-max-shard-size",
+        default=os.environ.get("TEUTONIC_MERGE_MAX_SHARD_SIZE", DEFAULT_MERGE_MAX_SHARD_SIZE),
+        help="Shard merged safetensors on save (default: %(default)s → ~4–5 files for "
+             "8.6B Quasar, Hippius upload). Set empty or TEUTONIC_MERGE_MAX_SHARD_SIZE= "
+             "for a single model.safetensors.",
     )
 
     args = ap.parse_args()

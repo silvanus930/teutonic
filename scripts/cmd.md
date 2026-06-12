@@ -163,11 +163,11 @@ python -u scripts/mining/train_challenger.py \
 
 Skips ~18 min scoring and does **not** reload 4×2G shards.
 
-hippius-hub upload yoko/teutonic-5ev4mnnc-006 /root/teutonic/s1-work/merged123 --revision main
+hippius-hub upload yoko/teutonic-5ev4mnnc-013 /root/teutonic/s1-work/merged1 --revision main
 
 python scripts/mining/submit_challenger.py \
-  --uploaded-repo yoko/teutonic-5ev4mnnc-012 \
-  --uploaded-digest sha256:06212d910349f515871646347bf4ee8ae9743a8b32b68a45245a139c543578c2 \
+  --uploaded-repo yoko/teutonic-5ev4mnnc-013 \
+  --uploaded-digest sha256:d46b852f45124435589d293d6097b9d9167e8bc47c288d118bc80fd04574941d \
   --wallet-name silvanus-hs1 \
   --hotkey hotkey41 \
   --netuid 3 \
@@ -212,7 +212,7 @@ python scripts/mining/submit_external_model.py \
   --report-out /root/teutonic/s1-work/verdict.json
 
 
-  export LOCAL_KING_DIR="/root/teutonic/s1-work/king1"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/king2"
 export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TRANSFORMERS_TRUST_REMOTE_CODE=true
@@ -232,7 +232,7 @@ python -u scripts/mining/train_challenger.py \
   cd /root/teutonic
 source .venv/bin/activate
 
-export LOCAL_KING_DIR="/root/teutonic/s1-work/test119"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/iter_00/merged"
 export TEUTONIC_SIM_HOTKEY="5GNJfDvtqqAjhwy9knrf9xTAhUu6hdZqwXELuY425Xio8a24"
 export TRANSFORMERS_TRUST_REMOTE_CODE=true
 export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
@@ -241,7 +241,7 @@ unset LOCAL_DATASET_MANIFEST
 
 python -u scripts/mining/validator_eval.py \
   --king "${LOCAL_KING_DIR}" \
-  --challenger /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-40037154544-rn/snapshots/5Ek5KoE5-40037154544-rn \
+  --challenger /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-57645162954-rn/snapshots/5Ek5KoE5-57645162954-rn \
   --hotkey "${TEUTONIC_SIM_HOTKEY}" \
   --n-public 500 \
   --batch-size 8 \
@@ -277,3 +277,8 @@ python -u scripts/mining/train_challenger.py \
   --final-eval-n 1000 \
   --n-eval 1000 \
   --report-out /root/teutonic/s1-work/verdict.json
+
+
+  python scripts/mining/reshard_merged.py \
+  --in /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-57645162954-rn/snapshots/5Ek5KoE5-57645162954-rn \
+  --out /root/teutonic/s1-work/merged1
