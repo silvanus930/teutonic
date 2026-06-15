@@ -43,6 +43,7 @@ print('OK: all imports pass')
 
 # ---- Step 2: py_compile all changed scripts ----
 echo "[smoke] syntax-checking Python files..."
+python -m py_compile scripts/mining/download_dataset.py
 python -m py_compile scripts/mining/dataset_mixture.py
 python -m py_compile scripts/mining/train_challenger.py
 python -m py_compile scripts/mining/cache_utils.py

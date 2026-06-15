@@ -233,11 +233,7 @@ python -u scripts/mining/train_challenger.py \
 source .venv/bin/activate
 
 export LOCAL_KING_DIR="/root/teutonic/s1-work/iter_00/merged"
-export TEUTONIC_SIM_HOTKEY="5GNJfDvtqqAjhwy9knrf9xTAhUu6hdZqwXELuY425Xio8a24"
-export TRANSFORMERS_TRUST_REMOTE_CODE=true
-export TEUTONIC_EVAL_DATASET_MODE=raw_hippius
 export TEUTONIC_RAW_TOKENIZER_REPO="${LOCAL_KING_DIR}"
-unset LOCAL_DATASET_MANIFEST
 
 python -u scripts/mining/validator_eval.py \
   --king "${LOCAL_KING_DIR}" \

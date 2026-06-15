@@ -10,8 +10,10 @@ import hashlib
 import json
 import logging
 import subprocess
+import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -280,7 +282,9 @@ def resolve_shard_url(shard_key: str, hippius_base: str) -> str:
     return f"{hippius_base.rstrip('/')}/{key.lstrip('/')}"
 
 
-def download_shard_cached(source: DatasetSource, shard_key: str) -> Path:
+def download_shard_cached(
+    source: DatasetSource, shard_key: str, *, force: bool = False,
+) -> Path:
     local_path = Path(shard_key)
     if local_path.is_file() and local_path.stat().st_size > 1024:
         return local_path
@@ -290,7 +294,9 @@ def download_shard_cached(source: DatasetSource, shard_key: str) -> Path:
     name = Path(shard_key).name or "shard.npy"
     out = source.shard_cache_dir / f"{key_hash}_{name}"
     if out.is_file() and out.stat().st_size > 1024:
-        return out
+        if not force:
+            return out
+        out.unlink()
 
     url = resolve_shard_url(shard_key, source.hippius_base)
     log.info("downloading %s shard %s", source.name, name)
@@ -466,3 +472,204 @@ def prepare_mixture_eval_pools(
         pools[source.name] = refs_to_eval_pool(store, refs)
         log.info("eval pool %s: %d sequences", source.name, len(refs))
     return pools
+
+
+@dataclass
+class ShardDownloadResult:
+    dataset: str
+    shard_key: str
+    path: str
+    status: str
+    bytes: int
+    error: str = ""
+
+
+def collect_mixture_shard_keys(
+    cfg: MixtureConfig,
+    *,
+    shards_per_dataset: int = 12,
+    seed: int = 42,
+    dataset_names: list[str] | None = None,
+    download_all: bool = False,
+) -> dict[str, list[str]]:
+    """Return shard keys to prefetch per dataset (same pool logic as training)."""
+    store = MixtureShardStore(cfg)
+    keys_by_dataset: dict[str, list[str]] = {}
+    for source in cfg.sources:
+        if dataset_names and source.name not in dataset_names:
+            continue
+        entries = store._shard_meta[source.name]
+        if download_all:
+            keys = [key for key, _ in entries]
+        else:
+            pool = store.select_shard_pool(source.name, seed, shards_per_dataset)
+            keys = [key for key, _ in pool]
+        keys_by_dataset[source.name] = keys
+        log.info(
+            "dataset %s: selected %d / %d shard(s)",
+            source.name, len(keys), len(entries),
+        )
+    return keys_by_dataset
+
+
+def _shard_download_status(
+    source: DatasetSource, shard_key: str, *, force: bool,
+) -> tuple[str, Path]:
+    """Return (status, path) without downloading when status would be 'cached'."""
+    local_path = Path(shard_key)
+    if local_path.is_file() and local_path.stat().st_size > 1024:
+        return "cached", local_path
+
+    key_hash = hashlib.sha256(shard_key.encode()).hexdigest()[:16]
+    name = Path(shard_key).name or "shard.npy"
+    out = source.shard_cache_dir / f"{key_hash}_{name}"
+    if out.is_file() and out.stat().st_size > 1024 and not force:
+        return "cached", out
+    return "pending", out
+
+
+def _download_one_shard(
+    source: DatasetSource, shard_key: str, *, force: bool,
+) -> ShardDownloadResult:
+    status_before, expected = _shard_download_status(source, shard_key, force=force)
+    if status_before == "cached":
+        return ShardDownloadResult(
+            dataset=source.name,
+            shard_key=shard_key,
+            path=str(expected),
+            status="cached",
+            bytes=expected.stat().st_size,
+        )
+    try:
+        path = download_shard_cached(source, shard_key, force=force)
+        return ShardDownloadResult(
+            dataset=source.name,
+            shard_key=shard_key,
+            path=str(path),
+            status="downloaded",
+            bytes=path.stat().st_size,
+        )
+    except Exception as exc:
+        return ShardDownloadResult(
+            dataset=source.name,
+            shard_key=shard_key,
+            path=str(expected),
+            status="failed",
+            bytes=0,
+            error=str(exc),
+        )
+
+
+def download_mixture_datasets(
+    cfg: MixtureConfig,
+    *,
+    shards_per_dataset: int = 12,
+    seed: int = 42,
+    dataset_names: list[str] | None = None,
+    download_all: bool = False,
+    manifests_only: bool = False,
+    force: bool = False,
+    workers: int = 4,
+    dry_run: bool = False,
+) -> dict:
+    """Prefetch manifests and shards for a mixture config."""
+    t0 = time.time()
+    manifests: dict[str, dict] = {}
+    for source in cfg.sources:
+        if dataset_names and source.name not in dataset_names:
+            continue
+        manifests[source.name] = fetch_manifest_cached(source)
+
+    keys_by_dataset = collect_mixture_shard_keys(
+        cfg,
+        shards_per_dataset=shards_per_dataset,
+        seed=seed,
+        dataset_names=dataset_names,
+        download_all=download_all,
+    )
+
+    planned: list[tuple[DatasetSource, str]] = []
+    for source in cfg.sources:
+        if dataset_names and source.name not in dataset_names:
+            continue
+        for shard_key in keys_by_dataset.get(source.name, []):
+            planned.append((source, shard_key))
+
+    if dry_run or manifests_only:
+        return {
+            "preset": cfg.preset,
+            "manifests_only": manifests_only,
+            "dry_run": dry_run,
+            "datasets": {
+                name: {
+                    "manifest_url": next(s.manifest_url for s in cfg.sources if s.name == name),
+                    "manifest_cache": str(next(s.manifest_cache for s in cfg.sources if s.name == name)),
+                    "manifest_hash": manifest_hash(manifests[name]),
+                    "shard_count_manifest": len(manifests[name].get("shards") or []),
+                    "shard_count_planned": len(keys_by_dataset.get(name, [])),
+                    "shard_keys": keys_by_dataset.get(name, []),
+                }
+                for name in manifests
+            },
+            "totals": {
+                "datasets": len(manifests),
+                "shards_planned": len(planned),
+                "shards_downloaded": 0,
+                "shards_cached": 0,
+                "shards_failed": 0,
+                "bytes": 0,
+            },
+            "results": [],
+            "elapsed_s": round(time.time() - t0, 2),
+        }
+
+    workers = max(1, workers)
+    results: list[ShardDownloadResult] = []
+    if workers == 1:
+        for source, shard_key in planned:
+            results.append(_download_one_shard(source, shard_key, force=force))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {
+                pool.submit(_download_one_shard, source, key, force=force): (source, key)
+                for source, key in planned
+            }
+            for fut in as_completed(futs):
+                results.append(fut.result())
+
+    failed = [r for r in results if r.status == "failed"]
+    if failed:
+        sample = failed[0]
+        raise RuntimeError(
+            f"{len(failed)} shard download(s) failed; first: {sample.dataset} "
+            f"{sample.shard_key}: {sample.error}"
+        )
+
+    downloaded = sum(1 for r in results if r.status == "downloaded")
+    cached = sum(1 for r in results if r.status == "cached")
+    total_bytes = sum(r.bytes for r in results)
+    return {
+        "preset": cfg.preset,
+        "weights": cfg.weights,
+        "datasets": {
+            name: {
+                "manifest_url": next(s.manifest_url for s in cfg.sources if s.name == name),
+                "manifest_cache": str(next(s.manifest_cache for s in cfg.sources if s.name == name)),
+                "manifest_hash": manifest_hash(manifests[name]),
+                "shard_count_manifest": len(manifests[name].get("shards") or []),
+                "shard_count_downloaded": len(keys_by_dataset.get(name, [])),
+                "shard_keys": keys_by_dataset.get(name, []),
+            }
+            for name in manifests
+        },
+        "totals": {
+            "datasets": len(manifests),
+            "shards_planned": len(planned),
+            "shards_downloaded": downloaded,
+            "shards_cached": cached,
+            "shards_failed": len(failed),
+            "bytes": total_bytes,
+        },
+        "results": [r.__dict__ for r in results],
+        "elapsed_s": round(time.time() - t0, 2),
+    }
