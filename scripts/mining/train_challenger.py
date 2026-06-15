@@ -13,14 +13,14 @@ Pipeline:
        Score cache: scored refs saved to work/score_cache/king_<hash>/ — reused
        across iterations without re-forwarding through the king.
   5. Build a curriculum (general / hard / easy buckets, drop suspicious).
-       Fractions: --general-frac --hard-frac --easy-frac (default 70/20/10).
-  6. Train a LoRA adapter with torchrun multi-GPU on the chosen training mix.
-       Presets: --candidate-preset {safe,main,aggressive} set lr/lora/epochs.
-  7. Merge LoRA into the base weights → standalone candidate dir.
-  8. Offline paired eval candidate vs king on a held-out shard slice
-     (mirrors validator's compute_paired_losses + bootstrap LCB > delta).
-       Acceptance gate: --acceptance-lcb-floor --mean-delta-floor
-       Best candidate: selected by LCB (not just mu_hat).
+       Fractions: --general-frac --hard-frac --easy-frac (default 60/30/10).
+  6. Train LoRA adapter(s) with optional --lora-sweep (adapter eval before merge).
+       Modes: --mode {fast,strong} for preset sweeps.
+  7. Merge only the best LoRA candidate after sweep.
+  8. Offline paired eval candidate vs king on held-out shard slice
+     (adapter-first during sweep; merged model for final eval).
+       Pre-submit gate: submit_decision in {DO_NOT_SUBMIT, PROMISING_NEEDS_MORE_EVAL,
+       READY_TO_MERGE, READY_TO_UPLOAD}. Upload requires --upload-approved.
   9. Emit a JSON verdict file. If accepted, optionally upload to HF.
 
 REQUIRED — coldkey prefix in --upload-repo (since 2026-04-29):
@@ -35,7 +35,6 @@ import hashlib
 import io
 import json
 import logging
-import math
 import os
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -49,7 +48,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -74,6 +72,53 @@ from hf_king_compat import (  # noqa: E402
     king_subprocess_env,
     patch_transformers_quasar_compat,
 )
+from cache_utils import (  # noqa: E402
+    download_shard_cached,
+    ensure_king_cached,
+    king_digest_dir,
+    load_score_cache,
+    save_score_cache,
+    score_cache_dir,
+)
+from curriculum import (  # noqa: E402
+    DEFAULT_EASY_FRAC,
+    DEFAULT_GENERAL_FRAC,
+    DEFAULT_HARD_FRAC,
+    assign_buckets,
+    build_curriculum,
+    build_mixture_curriculum,
+    bucket_means,
+    loss_summary as _loss_summary,
+    save_curriculum_reports,
+    write_curriculum_jsonl,
+)
+from dataset_mixture import (  # noqa: E402
+    MixtureConfig,
+    MixtureShardStore,
+    build_mixture_allocations,
+    build_mixture_config,
+    parse_bucket_mix_arg,
+    parse_dataset_manifest_arg,
+    parse_dataset_weight_arg,
+    prepare_mixture_eval_pools,
+    save_allocation_summary,
+)
+from paired_eval import (  # noqa: E402
+    compute_per_seq_loss,
+    gpu_memory_stats,
+    mixture_weighted_paired_eval,
+    mixture_weighted_paired_eval_adapter,
+    paired_eval_adapter,
+    paired_eval_merged,
+)
+from preflight import (  # noqa: E402
+    check_chain_match,
+    pre_submit_decision,
+    print_submit_verdict,
+    validate_merged_model,
+    validate_upload_repo,
+)
+from reporting import save_run_report  # noqa: E402
 
 patch_transformers_quasar_compat()
 ensure_quasar_arch_registered()
@@ -109,6 +154,76 @@ HIPPIUS_BASE = os.environ.get(
 # ~4–5 safetensor files for 8.6B Quasar (~17 GB); Hippius-friendly upload size.
 DEFAULT_MERGE_MAX_SHARD_SIZE = "3500MB"
 
+# Fast / probe / strong mode presets (CLI overrides still apply)
+MODE_PRESETS: dict[str, dict] = {
+    "fast": {
+        "n_score": 4000,
+        "train_per_iter": 3000,
+        "val_size": 400,
+        "n_eval": 768,
+        "epochs": 0.5,
+        "lora_dropout": 0.05,
+        "fast_eval": True,
+        "fast_eval_n": 768,
+        "final_eval_n": 768,
+        "lora_sweep": ["r32:a64:lr2e-4:d0.05:e0.5"],
+        "max_iters": 1,
+    },
+    "probe": {
+        "dataset_preset": "teutonic-mixture-v2",
+        "eval_mode": "local",
+        "n_score": 10000,
+        "train_per_iter": 6000,
+        "val_size": 800,
+        "n_eval": 1000,
+        "epochs": 0.5,
+        "lora_dropout": 0.05,
+        "fast_eval": True,
+        "fast_eval_n": 1000,
+        "final_eval_n": 1000,
+        "lora_sweep": [
+            "r32:a64:lr2e-4:d0.05:e0.5",
+            "r64:a128:lr1e-4:d0.05:e0.5",
+        ],
+        "abort_if_mu_hat_nonpositive": True,
+        "max_iters": 1,
+    },
+    "strong": {
+        "dataset_preset": "teutonic-mixture-v2",
+        "eval_mode": "local",
+        "n_score": 50000,
+        "train_per_iter": 24000,
+        "val_size": 3000,
+        "n_eval": 5000,
+        "epochs": 0.8,
+        "lora_dropout": 0.05,
+        "fast_eval": True,
+        "fast_eval_n": 3000,
+        "final_eval_n": 5000,
+        "dual_eval": True,
+        "lora_sweep": [
+            "r32:a64:lr2e-4:d0.05:e0.8",
+            "r64:a128:lr1e-4:d0.05:e0.8",
+            "r64:a64:lr1e-4:d0.05:e0.8",
+            "r128:a256:lr8e-5:d0.05:e0.7",
+        ],
+        "max_iters": 1,
+    },
+}
+
+GPU_PROFILE_PRESETS: dict[str, dict] = {
+    "a100-80gb": {
+        "micro_batch": 1,
+        "grad_accum": 16,
+        "gradient_checkpointing": True,
+    },
+    "a100-40gb": {
+        "micro_batch": 1,
+        "grad_accum": 32,
+        "gradient_checkpointing": True,
+    },
+}
+
 # Candidate training presets
 # Keys with value None = not set (use CLI default).
 # n_score=0 means skip king scoring; sample directly from local shards.
@@ -142,7 +257,7 @@ CANDIDATE_PRESETS: dict[str, dict] = {
         "min_lr_ratio": 0.10, "stable_ratio": 0.65,
         "adam_beta2": 0.95, "save_steps": 300, "eval_steps": 300,
         "n_score": 64000, "train_per_iter": 32768, "val_size": 1500,
-        "general_frac": 0.70, "hard_frac": 0.20, "easy_frac": 0.10,
+        "general_frac": 0.60, "hard_frac": 0.30, "easy_frac": 0.10,
         "fast_eval_n": 3000, "final_eval_n": 5000,
     },
     # ---- first-strike presets ----------------------------------------
@@ -180,11 +295,69 @@ CANDIDATE_PRESETS: dict[str, dict] = {
         "min_lr_ratio": 0.10, "stable_ratio": 0.0,
         "adam_beta2": 0.95, "save_steps": 300, "eval_steps": 300,
         "n_score": 64000, "train_per_iter": 32768, "val_size": 1500,
-        "general_frac": 0.70, "hard_frac": 0.20, "easy_frac": 0.10,
+        "general_frac": 0.60, "hard_frac": 0.30, "easy_frac": 0.10,
         "fast_eval_n": 3000, "final_eval_n": 5000,
     },
     "custom": {},  # all values from explicit CLI args
 }
+
+
+@dataclasses.dataclass
+class LoRASweepConfig:
+    label: str
+    lora_r: int
+    lora_alpha: int
+    lr: float
+    lora_dropout: float | None = None
+    epochs: float | None = None
+
+
+def parse_lora_sweep(specs: list[str]) -> list[LoRASweepConfig]:
+    """Parse sweep specs; supports comma lists and optional :d dropout / :e epochs.
+
+    Examples:
+      r64:a128:lr1e-4
+      r64:a128:lr1e-4:d0.05:e0.8
+      r32:a64:lr2e-4,r64:a128:lr1e-4
+    """
+    import re
+    pattern = re.compile(
+        r"^r(\d+):a(\d+):lr([\de.\-+]+)(?::d([\de.\-+]+))?(?::e([\de.\-+]+))?$",
+        re.IGNORECASE,
+    )
+    out: list[LoRASweepConfig] = []
+    for raw in specs:
+        for spec in raw.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            m = pattern.match(spec)
+            if not m:
+                raise ValueError(
+                    f"invalid LoRA sweep spec {spec!r}; "
+                    "expected r64:a128:lr1e-4 or r64:a128:lr1e-4:d0.05:e0.8"
+                )
+            label = spec.replace(":", "_").replace(",", "").lower()
+            dropout = float(m.group(4)) if m.group(4) is not None else None
+            epochs = float(m.group(5)) if m.group(5) is not None else None
+            out.append(LoRASweepConfig(
+                label=label,
+                lora_r=int(m.group(1)),
+                lora_alpha=int(m.group(2)),
+                lr=float(m.group(3)),
+                lora_dropout=dropout,
+                epochs=epochs,
+            ))
+    return out
+
+
+def _sweep_rank_key(entry: dict) -> tuple:
+    """Rank sweep candidates by mixture LCB, then mu_hat, then lower train eval loss."""
+    return (
+        float(entry.get("lcb") if entry.get("lcb") is not None else -999),
+        float(entry.get("mu_hat") if entry.get("mu_hat") is not None else -999),
+        -float(entry.get("eval_loss") if entry.get("eval_loss") is not None else 999),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,18 +393,7 @@ def load_shard(path: Path, seq_len: int = SEQ_LEN) -> tuple[np.ndarray, int]:
 
 
 def download_shard(shard_key: str, out: Path) -> Path:
-    local_path = Path(shard_key)
-    if local_path.is_file() and local_path.stat().st_size > 1024:
-        log.info("using local shard: %s (%.2f GB)", local_path, local_path.stat().st_size / 1e9)
-        return local_path
-    if out.exists() and out.stat().st_size > 1024:
-        log.info("shard cached: %s (%.1f GB)", out, out.stat().st_size / 1e9)
-        return out
-    url = f"{HIPPIUS_BASE}/{shard_key}"
-    log.info("downloading %s -> %s", url, out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call(["curl", "-fsSL", "-o", str(out), url])
-    return out
+    return download_shard_cached(shard_key, out.parent, HIPPIUS_BASE)
 
 
 def _resolve_local_manifest_paths(m: dict, base: Path) -> None:
@@ -507,30 +669,6 @@ def manifest_hash(manifest: dict) -> str:
 # ---------------------------------------------------------------------------
 # Paired eval (mirrors eval_torch.compute_paired_losses + bootstrap)
 # ---------------------------------------------------------------------------
-@torch.no_grad()
-def compute_per_seq_loss(model, token_batches, device, chunk=LM_HEAD_CHUNK):
-    input_ids = torch.tensor(token_batches, dtype=torch.long, device=device).contiguous()
-    if hasattr(model, "reset_state"):
-        model.reset_state()
-    out = model.model(input_ids)
-    hidden = out.last_hidden_state
-    lm_head = model.lm_head
-    n_pos = input_ids.size(1) - 1
-    total = torch.zeros(len(token_batches), device=device)
-    for i in range(0, n_pos, chunk):
-        end = min(i + chunk, n_pos)
-        logits = lm_head(hidden[:, i:end, :])
-        labels = input_ids[:, i + 1:end + 1]
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            reduction="none",
-        )
-        total += loss.reshape(len(token_batches), -1).sum(dim=1)
-        del logits, loss
-    return (total / n_pos).cpu().tolist()
-
-
 def paired_eval(
     king_dir: str, chall_dir: str, shard: np.ndarray,
     indices: list[int], device: str, batch_size: int = 8,
@@ -538,201 +676,33 @@ def paired_eval(
     acceptance_lcb_floor: float = EVAL_DELTA,
     mean_delta_floor: float = 0.0,
 ) -> dict:
-    """Local paired bootstrap test mirroring the validator."""
-    delta = EVAL_DELTA
-    log.info("paired_eval: loading king %s on %s", king_dir, device)
-    king = AutoModelForCausalLM.from_pretrained(
-        king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
+    """Local paired bootstrap test mirroring the validator (merged challenger)."""
+    result = paired_eval_merged(
+        king_dir, chall_dir, shard, indices, device,
+        batch_size=batch_size,
+        n_bootstrap=n_bootstrap,
+        alpha=alpha,
+        acceptance_lcb_floor=acceptance_lcb_floor,
+        mean_delta_floor=mean_delta_floor,
+        hf_remote_code_kwargs=_hf_remote_code_kwargs,
+        prepare_quasar_model=_prepare_quasar_model,
     )
-    _prepare_quasar_model(king)
-    king.eval()
-    log.info("paired_eval: loading challenger %s", chall_dir)
-    chall = AutoModelForCausalLM.from_pretrained(
-        chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True, **_hf_remote_code_kwargs(chall_dir),
-    )
-    _prepare_quasar_model(chall)
-    chall.eval()
-
-    diffs = []
-    king_sum = chall_sum = 0.0
-    n_done = 0
-    t0 = time.time()
-    for i in range(0, len(indices), batch_size):
-        batch_idx = indices[i:i + batch_size]
-        toks = [shard[j].tolist() for j in batch_idx]
-        kl = compute_per_seq_loss(king, toks, device)
-        cl = compute_per_seq_loss(chall, toks, device)
-        for k, c in zip(kl, cl):
-            diffs.append(k - c)
-            king_sum += k
-            chall_sum += c
-            n_done += 1
-        if (i // batch_size) % 5 == 0:
-            mu = float(np.mean(diffs))
-            log.info("eval %d/%d | mu_hat=%.6f | king=%.4f chall=%.4f | %.1fs",
-                     n_done, len(indices), mu,
-                     king_sum / n_done, chall_sum / n_done, time.time() - t0)
-
-    diffs = np.asarray(diffs, dtype=np.float64)
-    mu_hat = float(diffs.mean())
-    boot = np.empty(n_bootstrap)
-    rng = np.random.default_rng(0xB007)
-    for b in range(n_bootstrap):
-        boot[b] = diffs[rng.integers(0, len(diffs), size=len(diffs))].mean()
-    lcb = float(np.quantile(boot, alpha))
-
-    # Acceptance: lcb must exceed floor AND mean_delta must exceed floor
-    accepted = (
-        lcb > acceptance_lcb_floor
-        and mu_hat >= mean_delta_floor
-    )
-    rejection_reasons = []
-    if lcb <= acceptance_lcb_floor:
-        rejection_reasons.append(
-            f"lcb={lcb:.6f} <= acceptance_lcb_floor={acceptance_lcb_floor:.6f}"
-        )
-    if mean_delta_floor > 0 and mu_hat < mean_delta_floor:
-        rejection_reasons.append(
-            f"mu_hat={mu_hat:.6f} < mean_delta_floor={mean_delta_floor:.6f}"
-        )
-
-    res = {
-        "eval_mode": "local",
-        "n_eval": n_done,
-        "mu_hat": mu_hat,
-        "mean_delta": mu_hat,
-        "lcb": lcb,
-        "delta": delta,
-        "delta_threshold": delta,
-        "alpha": alpha,
-        "acceptance_lcb_floor": acceptance_lcb_floor,
-        "mean_delta_floor": mean_delta_floor,
-        "accepted": accepted,
-        "rejection_reasons": rejection_reasons,
-        "avg_king_loss": king_sum / max(1, n_done),
-        "avg_chall_loss": chall_sum / max(1, n_done),
-        "avg_challenger_loss": chall_sum / max(1, n_done),
-        "elapsed_s": time.time() - t0,
-        "note": "local mode: holdout from mining data pool (not validator seeds)",
-    }
-    log.info("paired_eval: mu_hat=%.6f lcb=%.6f accepted=%s rejection=%s",
-             mu_hat, lcb, accepted, rejection_reasons or "none")
-    del king, chall
-    torch.cuda.empty_cache()
-    return res
+    result["note"] = "local mode: holdout from mining data pool (not validator seeds)"
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Score cache
-# ---------------------------------------------------------------------------
+# Legacy wrappers — delegate to cache_utils
 def _score_cache_dir(work: Path, king_hash: str, manifest: dict) -> Path:
-    mhash = manifest_hash(manifest)[:8]
-    return work / "score_cache" / f"king_{king_hash[:16]}" / f"manifest_{mhash}"
+    shard_keys = [s.get("key", "") for s in manifest.get("shards", []) if s.get("key")]
+    return score_cache_dir(work, king_hash, shard_keys or ["legacy"], SEQ_LEN)
 
 
-def _shard_key_hash(shard_key: str) -> str:
-    """Stable 12-char hash of a manifest shard key for cache file naming.
-    Uses shard key (not local list index) so cache is stable across --shard-start changes.
-    """
-    return hashlib.sha256(shard_key.encode()).hexdigest()[:12]
+def _load_score_cache(cache_dir: Path, shard_keys: list[str]) -> list[dict] | None:
+    return load_score_cache(cache_dir, shard_keys)
 
 
-def _load_score_cache(
-    cache_dir: Path, shard_keys: list[str],
-) -> list[dict] | None:
-    """Load scored rows for specified manifest shard keys.
-    Returns None if any shard's cache file is missing.
-    Normalises 'shard_id'/'shard_key' back to local 'shard' index.
-    """
-    key_to_local = {k: i for i, k in enumerate(shard_keys)}
-    all_rows: list[dict] = []
-    for shard_key in shard_keys:
-        fname = f"scored_shard_{_shard_key_hash(shard_key)}.jsonl"
-        p = cache_dir / fname
-        if not p.is_file():
-            log.info("score cache miss: %s (key=%s)", fname, shard_key)
-            return None
-        with open(p) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                r = json.loads(line)
-                # Map shard_key back to local shard index
-                sk = r.get("shard_key", shard_key)
-                r["shard"] = key_to_local.get(sk, r.get("shard", 0))
-                if "idx" not in r and "row_idx" in r:
-                    r["idx"] = r["row_idx"]
-                all_rows.append(r)
-    log.info("score cache hit: %d rows from %d shard(s)", len(all_rows), len(shard_keys))
-    return all_rows
-
-
-def _save_score_cache(
-    cache_dir: Path, shard_keys: list[str], rows: list[dict],
-) -> None:
-    """Save scored rows keyed by manifest shard key hash (not local list index).
-    This makes the cache stable across --shard-start / --n-shards changes.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    # Group rows by their local shard index
-    by_local: dict[int, list[dict]] = {i: [] for i in range(len(shard_keys))}
-    for r in rows:
-        si = int(r.get("shard", 0))
-        if si in by_local:
-            by_local[si].append(r)
-    for local_idx, shard_rows in by_local.items():
-        shard_key = shard_keys[local_idx]
-        khash = _shard_key_hash(shard_key)
-        fname = f"scored_shard_{khash}.jsonl"
-        p = cache_dir / fname
-        tmp = cache_dir / f"{fname}.tmp"
-        with open(tmp, "w") as f:
-            for r in shard_rows:
-                f.write(json.dumps({
-                    "shard_key": shard_key,
-                    "shard_key_hash": khash,
-                    "row_idx": r.get("idx"),
-                    "loss": r.get("loss"),
-                    "bucket": r.get("bucket", ""),
-                    "unique_r": r.get("unique_r"),
-                    "rep_r": r.get("rep_r"),
-                    "rep_ng4": r.get("rep_ng4"),
-                }) + "\n")
-        shutil.move(str(tmp), str(p))
-    log.info("score cache saved: %d shard file(s) in %s", len(by_local), cache_dir)
-
-
-# ---------------------------------------------------------------------------
-# Scoring helpers
-# ---------------------------------------------------------------------------
-def _loss_summary(losses: np.ndarray) -> dict:
-    if len(losses) == 0:
-        return {}
-    return {
-        "n": int(len(losses)),
-        "min": float(losses.min()),
-        "max": float(losses.max()),
-        "mean": float(losses.mean()),
-        "std": float(losses.std()),
-        "p10": float(np.percentile(losses, 10)),
-        "p25": float(np.percentile(losses, 25)),
-        "p50": float(np.percentile(losses, 50)),
-        "p75": float(np.percentile(losses, 75)),
-        "p85": float(np.percentile(losses, 85)),
-        "p90": float(np.percentile(losses, 90)),
-    }
-
-
-def _bucket_means(rows: list[dict], key: str = "loss") -> dict[str, float]:
-    out: dict[str, float] = {}
-    for b in ("general", "hard", "easy", "suspicious"):
-        vals = [r[key] for r in rows if r.get("bucket") == b]
-        if vals:
-            out[b] = float(np.mean(vals))
-    return out
+def _save_score_cache(cache_dir: Path, shard_keys: list[str], rows: list[dict]) -> None:
+    save_score_cache(cache_dir, shard_keys, rows, include_input_ids=True)
 
 
 # ---------------------------------------------------------------------------
@@ -749,9 +719,9 @@ def score_and_curate(
     seed: int,
     device: str,
     work: Path,
-    general_frac: float = 0.70,
-    hard_frac: float = 0.20,
-    easy_frac: float = 0.10,
+    general_frac: float = DEFAULT_GENERAL_FRAC,
+    hard_frac: float = DEFAULT_HARD_FRAC,
+    easy_frac: float = DEFAULT_EASY_FRAC,
     max_suspicious_frac: float = 0.0,
     score_cache_path: Path | None = None,
     force_rescore: bool = False,
@@ -829,7 +799,7 @@ def score_and_curate(
                     "unique_r": unique_r,
                     "rep_r": rep_r,
                     "rep_ng4": rep_ng,
-                    # NOTE: no "tokens" field — load from shard arrays when writing jsonl
+                    "input_ids": tok,
                 })
             if batch_i % log_every == 0 or i + BATCH >= len(cands):
                 done = min(i + BATCH, len(cands))
@@ -847,133 +817,49 @@ def score_and_curate(
         log.info("scoring done in %.1fs (%d rows)", time.time() - t_score, len(rows))
 
         if score_cache_path:
-            _save_score_cache(score_cache_path, shard_keys, rows)
+            _save_score_cache(score_cache_path, sampled_keys, rows)
 
-    # --- loss distribution ---
+    # Backfill input_ids from shards when loading legacy cache entries
+    for r in rows:
+        if r.get("input_ids") is None and shards is not None:
+            r["input_ids"] = shards[r["shard"]][r["idx"]].tolist()
+
+    counts, p50, p85 = assign_buckets(rows)
     losses = np.asarray([r["loss"] for r in rows])
     loss_stats = _loss_summary(losses)
-    p50 = loss_stats.get("p50", float(np.median(losses)))
-    p85 = loss_stats.get("p85", float(np.percentile(losses, 85)))
-    general_floor = p50 * 0.8
-
-    log.info(
-        "loss dist: min=%.4f max=%.4f mean=%.4f std=%.4f "
-        "p10=%.4f p25=%.4f p50=%.4f p75=%.4f p85=%.4f p90=%.4f",
-        loss_stats.get("min", 0), loss_stats.get("max", 0),
-        loss_stats.get("mean", 0), loss_stats.get("std", 0),
-        loss_stats.get("p10", 0), loss_stats.get("p25", 0), p50,
-        loss_stats.get("p75", 0), p85, loss_stats.get("p90", 0),
-    )
-    log.info(
-        "bucket thresholds: suspicious=rep_r>0.2|rep_ng4>0.5|unique_r<0.05 | "
-        "hard=loss>=%.4f | general=loss>=%.4f | else=easy",
-        p85, general_floor,
-    )
-
-    def _bucket(r: dict) -> str:
-        if r["rep_r"] > 0.2 or r["rep_ng4"] > 0.5 or r["unique_r"] < 0.05:
-            return "suspicious"
-        if math.isnan(r["loss"]) or math.isinf(r["loss"]):
-            return "suspicious"
-        if r["loss"] >= p85:
-            return "hard"
-        if r["loss"] >= general_floor:
-            return "general"
-        return "easy"
-
-    for r in rows:
-        if "bucket" not in r or not r["bucket"]:
-            r["bucket"] = _bucket(r)
-
-    counts = {b: sum(1 for r in rows if r.get("bucket") == b)
-              for b in ("general", "hard", "easy", "suspicious")}
-    bucket_loss = _bucket_means(rows)
+    bucket_loss = bucket_means(rows)
     log.info(
         "buckets: %s | mean loss: %s",
         counts,
         {k: f"{v:.4f}" for k, v in bucket_loss.items()},
     )
 
-    # --- curriculum ---
-    clean = [r for r in rows if r.get("bucket") != "suspicious"]
-    dropped = len(rows) - len(clean)
-    log.info("dropped %d suspicious (%.1f%%), %d clean remain",
-             dropped, 100.0 * dropped / max(1, len(rows)), len(clean))
-
-    rng2 = np.random.default_rng(seed + 1)
-    order = rng2.permutation(len(clean)).tolist()
-    clean_shuffled = [clean[i] for i in order]
-    val_rows = clean_shuffled[:val_size]
-    val_keys = {(r["shard"], r["idx"]) for r in val_rows}
-    pool = [r for r in clean_shuffled if (r["shard"], r["idx"]) not in val_keys]
-
-    log.info("val=%d (requested %d), train pool=%d", len(val_rows), val_size, len(pool))
-
-    # Normalize fractions
-    total_frac = general_frac + hard_frac + easy_frac
-    if total_frac > 0:
-        gf = general_frac / total_frac
-        hf = hard_frac / total_frac
-        ef = easy_frac / total_frac
-    else:
-        gf, hf, ef = 0.70, 0.20, 0.10
-
-    general = [r for r in pool if r.get("bucket") == "general"]
-    hard = [r for r in pool if r.get("bucket") == "hard"]
-    easy = [r for r in pool if r.get("bucket") == "easy"]
-    n_general = int(train_per_iter * gf)
-    n_hard = int(train_per_iter * hf)
-    n_easy = train_per_iter - n_general - n_hard
-
-    log.info(
-        "curriculum mix target: general=%d (%.0f%%) hard=%d (%.0f%%) easy=%d (%.0f%%) | "
-        "pool: general=%d hard=%d easy=%d",
-        n_general, gf * 100, n_hard, hf * 100, n_easy, ef * 100,
-        len(general), len(hard), len(easy),
+    train_rows, val_rows, curriculum_summary = build_curriculum(
+        rows,
+        train_per_iter=train_per_iter,
+        val_size=val_size,
+        seed=seed,
+        general_frac=general_frac,
+        hard_frac=hard_frac,
+        easy_frac=easy_frac,
+        max_suspicious_frac=max_suspicious_frac,
     )
-
-    train_rows: list[dict] = []
-    picked: dict[str, int] = {}
-    for label, src, n in (("general", general, n_general),
-                          ("hard", hard, n_hard),
-                          ("easy", easy, n_easy)):
-        if not src:
-            picked[label] = 0
-            if n > 0:
-                log.warning("curriculum: no %s samples in pool (wanted %d)", label, n)
-            continue
-        if n >= len(src):
-            train_rows.extend(src)
-            picked[label] = len(src)
-        else:
-            sel = rng2.choice(len(src), size=n, replace=False)
-            train_rows.extend(src[int(k)] for k in sel)
-            picked[label] = n
-        log.info("curriculum: %s → picked %d/%d", label, picked[label], len(src))
-
-    order2 = rng2.permutation(len(train_rows)).tolist()
-    train_rows = [train_rows[i] for i in order2]
-
-    train_mix = {b: sum(1 for r in train_rows if r.get("bucket") == b)
-                 for b in ("general", "hard", "easy")}
-    if train_rows:
-        tr_ls = _loss_summary(np.asarray([r["loss"] for r in train_rows]))
-        log.info(
-            "curriculum train: %d sequences | mix %s | loss mean=%.4f p50=%.4f",
-            len(train_rows), train_mix, tr_ls.get("mean", 0), tr_ls.get("p50", 0),
-        )
+    dropped = curriculum_summary.get("suspicious_dropped", 0)
+    train_mix = curriculum_summary.get("train_mix", {})
+    log.info(
+        "curriculum train: %d sequences | mix %s",
+        len(train_rows), train_mix,
+    )
     if len(train_rows) < train_per_iter:
         log.warning(
             "train set undersized (%d < %d); increase --n-score or data pool",
             len(train_rows), train_per_iter,
         )
 
-    # Print curriculum summary
     print(
         f"\n{'='*50}\n"
         f"CURRICULUM SUMMARY\n"
-        f"  scored: {len(rows)} | clean: {len(clean)} | "
-        f"suspicious: {dropped} ({100.0*dropped/max(1,len(rows)):.1f}%)\n"
+        f"  scored: {len(rows)} | suspicious dropped: {dropped}\n"
         f"  train: {len(train_rows)} | val: {len(val_rows)}\n"
         f"  mix: general={train_mix.get('general',0)} "
         f"hard={train_mix.get('hard',0)} easy={train_mix.get('easy',0)}\n"
@@ -982,72 +868,144 @@ def score_and_curate(
         flush=True,
     )
 
-    # --- write jsonl ---
     work.mkdir(parents=True, exist_ok=True)
-    train_p = work / "train.jsonl"
-    val_p = work / "val.jsonl"
-    scored_p = work / "scored.jsonl"
-    scoring_p = work / "scoring.json"
-    curriculum_p = work / "curriculum.json"
-
-    # scored.jsonl — lightweight refs only
-    with open(scored_p, "w") as f:
-        for r in rows:
-            f.write(json.dumps({
-                "shard": r["shard"], "idx": r["idx"],
-                "loss": r["loss"], "unique_r": r["unique_r"],
-                "rep_r": r["rep_r"], "rep_ng4": r["rep_ng4"], "bucket": r.get("bucket", ""),
-            }) + "\n")
-
-    # train.jsonl — tokens loaded from shard arrays (never stored in rows)
-    with open(train_p, "w") as f:
-        for r in train_rows:
-            toks = shards[r["shard"]][r["idx"]].tolist()
-            f.write(json.dumps({"input_ids": toks}) + "\n")
-
-    # val.jsonl — tokens loaded from shard arrays
-    with open(val_p, "w") as f:
-        for r in val_rows:
-            toks = shards[r["shard"]][r["idx"]].tolist()
-            f.write(json.dumps({"input_ids": toks}) + "\n")
-
-    scoring_report = {
-        "seed": seed,
-        "n_candidates": len(cands),
-        "loss": loss_stats,
-        "thresholds": {"p50": p50, "p85": p85, "general_floor": general_floor},
-        "bucket_counts": counts,
-        "bucket_mean_loss": bucket_loss,
-    }
-    curriculum_report = {
-        "seed": seed + 1,
-        "train_per_iter": train_per_iter,
-        "val_size": val_size,
-        "general_frac": general_frac,
-        "hard_frac": hard_frac,
-        "easy_frac": easy_frac,
-        "suspicious_dropped": dropped,
-        "clean_pool": len(clean),
-        "train_pool": len(pool),
-        "picked": picked,
-        "train_mix": train_mix,
-        "train_n": len(train_rows),
-        "val_n": len(val_rows),
-        "val_bucket_counts": {b: sum(1 for r in val_rows if r.get("bucket") == b)
-                              for b in ("general", "hard", "easy")},
-        "train_loss": _loss_summary(np.asarray([r["loss"] for r in train_rows])) if train_rows else {},
-        "val_loss": _loss_summary(np.asarray([r["loss"] for r in val_rows])) if val_rows else {},
-        # Report which shards participated in scoring/curriculum.
-        # For pretokenized manifests this is a list of manifest keys; for raw mode
-        # it's a single synthetic pool key.
-        "shards_used": sampled_keys,
-        "shards_used_local_indices": sampled_local_idxs,
-    }
-    json.dump(scoring_report, open(scoring_p, "w"), indent=2)
-    json.dump(curriculum_report, open(curriculum_p, "w"), indent=2)
-
+    train_p, val_p = write_curriculum_jsonl(train_rows, val_rows, work, shards)
+    save_curriculum_reports(
+        work, rows, curriculum_summary,
+        seed=seed,
+        n_candidates=len(cands),
+        shards_used=sampled_keys,
+        shards_used_local_indices=sampled_local_idxs,
+    )
     log.info("wrote train=%d val=%d | %s %s", len(train_rows), len(val_rows), train_p, val_p)
     return train_p, val_p
+
+
+def _score_dataset_candidates(
+    king_dir: str,
+    shards: list[np.ndarray],
+    shard_keys: list[str],
+    cands: list[tuple[int, int]],
+    device: str,
+    score_cache_path: Path | None,
+    force_rescore: bool,
+) -> list[dict]:
+    sampled_keys = [shard_keys[i] for i in sorted({s for s, _ in cands})]
+    cached_rows: list[dict] | None = None
+    if score_cache_path and not force_rescore and score_cache_path.is_dir():
+        cached_rows = _load_score_cache(score_cache_path, sampled_keys)
+
+    if cached_rows is not None:
+        rows = cached_rows
+        for r in rows:
+            if "row_idx" in r and "idx" not in r:
+                r["idx"] = r["row_idx"]
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
+            use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
+        )
+        _prepare_quasar_model(model)
+        model.eval()
+        rows = []
+        batch = 8
+        for i in range(0, len(cands), batch):
+            chunk = cands[i:i + batch]
+            toks = [shards[s][j].tolist() for s, j in chunk]
+            losses = compute_per_seq_loss(model, toks, device)
+            for (s_idx, j), tok, loss in zip(chunk, toks, losses):
+                arr = np.asarray(tok)
+                unique_r = float(len(set(tok)) / max(1, len(tok)))
+                rep_r = float(np.mean(arr[1:] == arr[:-1])) if len(arr) > 1 else 0.0
+                ngrams = [tuple(tok[k:k + 4]) for k in range(len(tok) - 3)]
+                rep_ng = 1.0 - len(set(ngrams)) / max(1, len(ngrams)) if ngrams else 0.0
+                rows.append({
+                    "shard": s_idx, "idx": j, "loss": float(loss),
+                    "unique_r": unique_r, "rep_r": rep_r, "rep_ng4": rep_ng,
+                    "input_ids": tok,
+                })
+        del model
+        torch.cuda.empty_cache()
+        if score_cache_path:
+            _save_score_cache(score_cache_path, sampled_keys, rows)
+
+    for r in rows:
+        if r.get("input_ids") is None:
+            r["input_ids"] = shards[r["shard"]][r["idx"]].tolist()
+    return rows
+
+
+def score_and_curate_mixture(
+    king_dir: str,
+    store: MixtureShardStore,
+    cfg: MixtureConfig,
+    allocations: dict,
+    seed: int,
+    device: str,
+    work: Path,
+    king_hash: str,
+    *,
+    shards_per_dataset: int = 12,
+    force_rescore: bool = False,
+    max_suspicious_frac: float = 0.0,
+    use_score_cache: bool = True,
+) -> tuple[Path, Path, dict]:
+    """Score and build curriculum across weighted mixture datasets."""
+    rows_by_dataset: dict[str, list[dict]] = {}
+    shards_used: list[str] = []
+
+    for source in cfg.sources:
+        n_score = allocations["n_score"].get(source.name, 0)
+        if n_score <= 0:
+            continue
+        ds_seed = seed + hash(source.name) % 100000
+        refs = store.sample_refs(source.name, n_score, ds_seed, shards_per_dataset)
+        cands = store.refs_to_candidates(refs)
+        shards_used.extend(sorted({r.shard_key for r in refs}))
+
+        cache_dir = None
+        if use_score_cache:
+            work_root = work
+            while work_root.name.startswith("iter_") and work_root.parent != work_root:
+                work_root = work_root.parent
+            cache_dir = store.score_cache_dir(work_root, king_hash, source.name)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+        log.info("mixture scoring %s: n=%d candidates", source.name, len(cands))
+        rows = _score_dataset_candidates(
+            king_dir, store.arrays, store.keys, cands, device,
+            cache_dir, force_rescore,
+        )
+        for r in rows:
+            r["dataset"] = source.name
+        assign_buckets(rows)
+        rows_by_dataset[source.name] = rows
+
+    train_rows, val_rows, curriculum_summary = build_mixture_curriculum(
+        rows_by_dataset,
+        train_alloc=allocations["train_per_iter"],
+        val_alloc=allocations["val_size"],
+        seed=seed,
+        bucket_mix=cfg.bucket_mix,
+        max_suspicious_frac=max_suspicious_frac,
+    )
+
+    all_rows = [r for rows in rows_by_dataset.values() for r in rows]
+    work.mkdir(parents=True, exist_ok=True)
+    train_p, val_p = write_curriculum_jsonl(train_rows, val_rows, work, store.arrays)
+    save_curriculum_reports(
+        work, all_rows, curriculum_summary,
+        seed=seed,
+        n_candidates=sum(len(v) for v in rows_by_dataset.values()),
+        shards_used=shards_used,
+        per_dataset_stats=curriculum_summary.get("per_dataset"),
+    )
+    save_allocation_summary(work, allocations)
+    log.info(
+        "mixture curriculum: train=%d val=%d across %d datasets",
+        len(train_rows), len(val_rows), len(rows_by_dataset),
+    )
+    return train_p, val_p, curriculum_summary
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1070,144 @@ def run_lora_training(
         else:
             raise RuntimeError(f"no adapter found in {out_dir}")
     return adapter
+
+
+def run_lora_sweep(
+    base_model: str,
+    train_p: Path,
+    val_p: Path,
+    sweep_out: Path,
+    sweep_configs: list[LoRASweepConfig],
+    n_gpus: int,
+    args: argparse.Namespace,
+    bundle: Path,
+    *,
+    eval_arr: np.ndarray | None,
+    eval_indices: list[int] | None,
+    eval_batch_size: int,
+    bootstrap: int,
+    alpha: float,
+    acceptance_lcb_floor: float,
+    mean_delta_floor: float,
+    fast_eval_n: int,
+    mixture_eval_pools: dict[str, tuple[np.ndarray, list[int]]] | None = None,
+    mixture_weights: dict[str, float] | None = None,
+    regression_datasets: tuple[str, ...] = (),
+    regression_mu_floor: float = -0.001,
+    regression_lcb_floor: float = -0.001,
+) -> tuple[LoRASweepConfig, Path, list[dict]]:
+    """Train and adapter-eval each LoRA config; return best config + adapter path."""
+    results: list[dict] = []
+    best_cfg: LoRASweepConfig | None = None
+    best_adapter: Path | None = None
+    best_score: tuple = (-999.0, -999.0, -999.0)
+
+    for cfg in sweep_configs:
+        log.info(
+            "=== LoRA sweep: %s (r=%d a=%d lr=%g d=%s e=%s) ===",
+            cfg.label, cfg.lora_r, cfg.lora_alpha, cfg.lr,
+            cfg.lora_dropout, cfg.epochs,
+        )
+        cfg_out = sweep_out / cfg.label
+        cfg_args = argparse.Namespace(**vars(args))
+        cfg_args.lora_r = cfg.lora_r
+        cfg_args.lora_alpha = cfg.lora_alpha
+        cfg_args.lr = cfg.lr
+        if cfg.lora_dropout is not None:
+            cfg_args.lora_dropout = cfg.lora_dropout
+        if cfg.epochs is not None:
+            cfg_args.epochs = cfg.epochs
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        t0 = time.time()
+        adapter = run_lora_training(
+            base_model, train_p, val_p, cfg_out,
+            n_gpus, cfg_args, bundle,
+        )
+        elapsed = time.time() - t0
+
+        train_summary: dict = {}
+        summary_path = cfg_out / "train_summary.json"
+        if summary_path.is_file():
+            train_summary = json.loads(summary_path.read_text())
+
+        paired: dict | None = None
+        if mixture_eval_pools and mixture_weights:
+            paired = mixture_weighted_paired_eval_adapter(
+                base_model, str(adapter), mixture_eval_pools, mixture_weights, "cuda:0",
+                batch_size=eval_batch_size,
+                n_bootstrap=bootstrap,
+                alpha=alpha,
+                acceptance_lcb_floor=acceptance_lcb_floor,
+                mean_delta_floor=mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+                regression_datasets=regression_datasets,
+                regression_mu_floor=regression_mu_floor,
+                regression_lcb_floor=regression_lcb_floor,
+            )
+            paired_path = cfg_out / "paired_eval_mixture_adapter.json"
+            paired_path.write_text(json.dumps(paired, indent=2, default=str))
+        elif eval_arr is not None and eval_indices is not None:
+            n_eval = min(fast_eval_n, len(eval_indices))
+            paired = paired_eval_adapter(
+                base_model, str(adapter), eval_arr, eval_indices[:n_eval], "cuda:0",
+                batch_size=eval_batch_size,
+                n_bootstrap=bootstrap,
+                alpha=alpha,
+                acceptance_lcb_floor=acceptance_lcb_floor,
+                mean_delta_floor=mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+            )
+            paired_path = cfg_out / "paired_eval_adapter.json"
+            paired_path.write_text(json.dumps(paired, indent=2))
+
+        entry = {
+            "config": (
+                f"r{cfg.lora_r}:a{cfg.lora_alpha}:lr{cfg.lr:g}"
+                + (f":d{cfg.lora_dropout:g}" if cfg.lora_dropout is not None else "")
+                + (f":e{cfg.epochs:g}" if cfg.epochs is not None else "")
+            ),
+            "label": cfg.label,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "lr": cfg.lr,
+            "lora_dropout": cfg.lora_dropout if cfg.lora_dropout is not None else args.lora_dropout,
+            "epochs": cfg.epochs if cfg.epochs is not None else args.epochs,
+            "train_loss": train_summary.get("final_train_loss"),
+            "eval_loss": train_summary.get("final_eval_loss"),
+            "best_checkpoint_eval_loss": train_summary.get("best_checkpoint_eval_loss"),
+            "mu_hat": paired.get("mixture_mu_hat", paired.get("mu_hat")) if paired else None,
+            "lcb": paired.get("mixture_lcb", paired.get("lcb")) if paired else None,
+            "accepted": paired.get("accepted") if paired else False,
+            "n_eval": paired.get("n_eval") if paired else 0,
+            "elapsed_s": round(elapsed, 1),
+            "adapter_dir": str(adapter),
+            "gpu_memory": gpu_memory_stats(),
+        }
+        results.append(entry)
+        log.info(
+            "sweep %s: eval_loss=%s mu_hat=%s lcb=%s accepted=%s (%.1fs)",
+            cfg.label, entry["eval_loss"], entry["mu_hat"], entry["lcb"],
+            entry["accepted"], elapsed,
+        )
+
+        score = _sweep_rank_key(entry)
+        if score > best_score:
+            best_score = score
+            best_cfg = cfg
+            best_adapter = adapter
+
+    if best_cfg is None or best_adapter is None:
+        raise RuntimeError("LoRA sweep produced no candidates")
+
+    sweep_report = sweep_out / "sweep_results.json"
+    sweep_report.write_text(json.dumps({"results": results, "best": best_cfg.label}, indent=2))
+    log.info("LoRA sweep best: %s -> %s", best_cfg.label, best_adapter)
+    return best_cfg, best_adapter, results
 
 
 def merge_lora(
@@ -1311,7 +1407,39 @@ def main():
         "--dataset-mix", default="",
         help="JSON with multiple v4 Hippius manifests + weights "
              "(see scripts/mining/dataset_mix_quasar_v4.json). "
-             "Overrides --dataset-mode / --local-dataset-manifest.",
+             "Enables mixture mode (alias for --dataset-preset teutonic-mixture-v2).",
+    )
+    ap.add_argument(
+        "--dataset-preset",
+        default="",
+        help="Dataset preset: teutonic-mixture-v2 (validator mixture) or legacy (single manifest).",
+    )
+    ap.add_argument(
+        "--dataset-manifest", action="append", default=[],
+        help="Override/add dataset manifest: name=https://.../manifest.json",
+    )
+    ap.add_argument(
+        "--dataset-weight", action="append", default=[],
+        help="Override dataset weight: name=0.35",
+    )
+    ap.add_argument(
+        "--dataset-names", default="",
+        help="Comma-separated subset of dataset names to include in mixture.",
+    )
+    ap.add_argument(
+        "--bucket-mix", action="append", default=[],
+        help="Per-dataset curriculum bucket override: name=general:hard:easy "
+             "(e.g. finewebedu=0.7:0.2:0.1)",
+    )
+    ap.add_argument(
+        "--regression-datasets", default="automathtext-v2,ultradata-math,finewebedu",
+        help="Comma-separated datasets checked for negative mu_hat/lcb regression.",
+    )
+    ap.add_argument("--regression-mu-floor", type=float, default=-0.001)
+    ap.add_argument("--regression-lcb-floor", type=float, default=-0.001)
+    ap.add_argument(
+        "--no-block-on-regression", action="store_true",
+        help="Warn on per-dataset regression but do not block submission.",
     )
     ap.add_argument(
         "--mix-shard-cache", default="",
@@ -1371,6 +1499,56 @@ def main():
     ap.add_argument("--hard-frac", type=float, default=None)
     ap.add_argument("--easy-frac", type=float, default=None)
     ap.add_argument("--max-suspicious-frac", type=float, default=0.0)
+
+    # Fast / probe / strong modes and LoRA sweep
+    ap.add_argument(
+        "--mode", choices=("fast", "probe", "strong"), default="",
+        help="Preset mode: fast, probe (cheap beatability check), or strong (A100 run).",
+    )
+    ap.add_argument(
+        "--lora-sweep", action="append", default=[],
+        help="LoRA sweep spec (repeatable or comma-separated). "
+             "Example: r64:a128:lr1e-4:d0.05:e0.8",
+    )
+    ap.add_argument(
+        "--merge-best-only", action="store_true", default=True,
+        help="During sweep, merge only the best adapter (default: on).",
+    )
+    ap.add_argument(
+        "--no-merge-best-only", action="store_false", dest="merge_best_only",
+        help="Merge after each sweep config (legacy behavior).",
+    )
+    ap.add_argument(
+        "--skip-chain-check", action="store_true",
+        help="Skip chain.toml vs dashboard chain name verification.",
+    )
+    ap.add_argument(
+        "--force-king-redownload", action="store_true",
+        help="Re-download king even if digest cache exists.",
+    )
+
+    ap.add_argument(
+        "--abort-if-mu-hat-nonpositive", action="store_true",
+        help="After LoRA sweep, exit before merge if best mixture mu_hat <= 0.",
+    )
+    ap.add_argument(
+        "--dual-eval", action="store_true",
+        help="Run mixture local eval as primary verdict, then validator-style eval.",
+    )
+
+    # Pre-submit gate
+    ap.add_argument("--preferred-lcb-margin", type=float, default=0.0035)
+    ap.add_argument("--preferred-mu-hat", type=float, default=0.0075)
+    ap.add_argument("--min-final-n-eval", type=int, default=3000)
+    ap.add_argument(
+        "--upload-approved", action="store_true",
+        help="Allow HF upload when pre-submit gate passes (never uploads by default).",
+    )
+    ap.add_argument(
+        "--submit-approved", action="store_true",
+        help="Alias for --upload-approved (no on-chain reveal is performed here).",
+    )
+    ap.add_argument("--coldkey-prefix", default="", help="First 8 ss58 chars for upload repo check.")
 
     # Iteration control
     ap.add_argument("--max-iters", type=int, default=3)
@@ -1464,8 +1642,14 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if verdict.json already exists for that iter")
 
-    # Profile (legacy backward compat)
-    ap.add_argument("--profile", choices=("default", "prod"), default="default")
+    # Profile (legacy + GPU presets)
+    ap.add_argument(
+        "--profile",
+        choices=("default", "prod", "a100-80gb", "a100-40gb"),
+        default="default",
+        help="GPU / training profile. a100-80gb: micro_batch=1 grad_accum=16; "
+             "a100-40gb: micro_batch=1 grad_accum=32.",
+    )
 
     # Upload / report
     ap.add_argument("--upload-repo", default="")
@@ -1481,7 +1665,48 @@ def main():
 
     args = ap.parse_args()
 
-    # --- apply preset (explicit CLI args with non-None default override preset) ---
+    if args.submit_approved:
+        args.upload_approved = True
+
+    # --- apply --mode preset (explicit CLI args override via None defaults) ---
+    mode_preset = MODE_PRESETS.get(args.mode, {}) if args.mode else {}
+    for key, value in mode_preset.items():
+        if key == "lora_sweep":
+            if not args.lora_sweep:
+                args.lora_sweep = list(value)
+            continue
+        if key == "fast_eval" and not any(a.startswith("--fast-eval") for a in sys.argv):
+            args.fast_eval = bool(value)
+            continue
+        if key == "dual_eval" and not any(a.startswith("--dual-eval") for a in sys.argv):
+            args.dual_eval = bool(value)
+            continue
+        if key == "abort_if_mu_hat_nonpositive" and not any(
+            a.startswith("--abort-if-mu-hat") for a in sys.argv
+        ):
+            args.abort_if_mu_hat_nonpositive = bool(value)
+            continue
+        if key == "dataset_preset" and not args.dataset_preset:
+            args.dataset_preset = str(value)
+            continue
+        if key == "eval_mode" and not any(a.startswith("--eval-mode") for a in sys.argv):
+            args.eval_mode = str(value)
+            continue
+        if getattr(args, key, None) is None and hasattr(args, key):
+            setattr(args, key, value)
+        elif key in ("lora_dropout", "epochs", "micro_batch", "grad_accum") and hasattr(args, key):
+            if not any(f"--{key.replace('_', '-')}" in a for a in sys.argv):
+                setattr(args, key, value)
+
+    # --- apply GPU profile ---
+    if args.profile in GPU_PROFILE_PRESETS:
+        for key, value in GPU_PROFILE_PRESETS[args.profile].items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+        log.info("GPU profile=%s applied (micro_batch=%d grad_accum=%d)",
+                 args.profile, args.micro_batch, args.grad_accum)
+
+    # --- apply candidate preset (explicit CLI args with non-None default override preset) ---
     preset = CANDIDATE_PRESETS.get(args.candidate_preset, {})
 
     def _p(attr: str, key: str | None = None, fallback=None):
@@ -1511,9 +1736,9 @@ def main():
     _p("n_score", fallback=4000)
     _p("train_per_iter", fallback=4000)
     _p("val_size", fallback=400)
-    _p("general_frac", fallback=0.70)
-    _p("hard_frac", fallback=0.20)
-    _p("easy_frac", fallback=0.10)
+    _p("general_frac", fallback=DEFAULT_GENERAL_FRAC)
+    _p("hard_frac", fallback=DEFAULT_HARD_FRAC)
+    _p("easy_frac", fallback=DEFAULT_EASY_FRAC)
     _p("fast_eval_n", fallback=3000)
     _p("final_eval_n", "final_eval_n", fallback=None)
 
@@ -1600,10 +1825,63 @@ def main():
     if args.eval_mode == "validator":
         os.environ.setdefault("TEUTONIC_EVAL_DATASET_MODE", "raw_hippius")
 
+    if not args.skip_chain_check:
+        check_chain_match(chain_config.NAME, DASHBOARD_URL, strict=True)
+
+    regression_datasets = tuple(
+        x.strip() for x in args.regression_datasets.split(",") if x.strip()
+    )
+
+    # --- mixture dataset config ---
+    manifest_overrides = [parse_dataset_manifest_arg(m) for m in args.dataset_manifest]
+    weight_overrides = dict(parse_dataset_weight_arg(w) for w in args.dataset_weight)
+    bucket_mix_overrides = dict(parse_bucket_mix_arg(b) for b in args.bucket_mix)
+    dataset_names = [x.strip() for x in args.dataset_names.split(",") if x.strip()] or None
+    mix_json = (
+        args.dataset_mix or os.environ.get("TEUTONIC_DATASET_MIX", "")
+    ).strip()
+    use_mixture = (
+        args.dataset_preset == "teutonic-mixture-v2"
+        or bool(mix_json)
+        or bool(manifest_overrides)
+        or bool(weight_overrides)
+    )
+    if args.dataset_preset == "legacy":
+        use_mixture = False
+
+    mixture_cfg: MixtureConfig | None = None
+    mixture_store: MixtureShardStore | None = None
+    mixture_allocations: dict | None = None
+    mixture_eval_pools: dict[str, tuple[np.ndarray, list[int]]] | None = None
+
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
+
+    if use_mixture:
+        mixture_cfg = build_mixture_config(
+            preset=args.dataset_preset or "teutonic-mixture-v2",
+            cache_root=cache,
+            seq_len=args.seq_len,
+            dataset_manifests=manifest_overrides or None,
+            dataset_weights=weight_overrides or None,
+            dataset_names=dataset_names,
+            mix_json_path=mix_json,
+            bucket_mix_overrides=bucket_mix_overrides or None,
+        )
+        mixture_store = MixtureShardStore(mixture_cfg)
+        log.info(
+            "dataset preset=%s (%d sources, weights=%s)",
+            mixture_cfg.preset,
+            len(mixture_cfg.sources),
+            ", ".join(f"{n}={w:.2f}" for n, w in mixture_cfg.weights.items()),
+        )
+
+    sweep_configs: list[LoRASweepConfig] = []
+    if args.lora_sweep:
+        sweep_configs = parse_lora_sweep(args.lora_sweep)
+        log.info("LoRA sweep: %d config(s): %s", len(sweep_configs), args.lora_sweep)
 
     # ---- 1. King ----
     work_king_dir = work / "king"
@@ -1636,22 +1914,47 @@ def main():
             )
     else:
         king = fetch_king()
-        king_dir = work_king_dir
-        if king_dir.exists():
-            shutil.rmtree(king_dir)
-        log.info("downloading king to %s", king_dir)
         rev = king.get("king_revision") or None
-        # Dashboard revisions may be encoded as immutable digests like "hf:<commit>".
-        # huggingface_hub expects the raw git commit hash (without the "hf:" prefix).
         if isinstance(rev, str) and rev.startswith("hf:"):
             rev = rev[len("hf:"):]
-        snapshot_download(
-            king["hf_repo"],
-            local_dir=str(king_dir),
-            revision=rev,
-            token=args.hf_token or None,
-            max_workers=16,
-        )
+        cache_key = hashlib.sha256(
+            f"{king['hf_repo']}|{rev or 'HEAD'}".encode(),
+        ).hexdigest()[:16]
+        meta_path = work / "king_cache" / f"meta_{cache_key}.json"
+        king_dir = None
+        if meta_path.is_file() and not args.force_king_redownload:
+            try:
+                meta = json.loads(meta_path.read_text())
+                candidate = Path(meta.get("path", ""))
+                if candidate.is_dir() and (candidate / "config.json").is_file():
+                    king_dir = candidate
+                    log.info("king digest cache hit: %s", king_dir)
+            except Exception:
+                pass
+        if king_dir is None:
+            staging = work / "king_cache" / f"staging_{cache_key}"
+            ensure_king_cached(
+                king["hf_repo"], rev, staging,
+                hf_token=args.hf_token,
+                force=args.force_king_redownload,
+            )
+            king_hash_staging = sha256_dir(staging)
+            king_dir = king_digest_dir(work, king_hash_staging)
+            if king_dir.exists() and not args.force_king_redownload:
+                shutil.rmtree(staging)
+                log.info("king digest dir already present: %s", king_dir)
+            elif staging.resolve() != king_dir.resolve():
+                if king_dir.exists():
+                    shutil.rmtree(king_dir)
+                shutil.move(str(staging), str(king_dir))
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({
+                "path": str(king_dir),
+                "repo": king["hf_repo"],
+                "revision": king.get("king_revision"),
+                "digest": sha256_dir(king_dir),
+            }, indent=2))
+            log.info("king cached by digest: %s", king_dir)
 
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
@@ -1679,26 +1982,43 @@ def main():
     mix_index: MixedDatasetIndex | None = None
     mix_cache_dir: Path | None = None
 
-    dataset_mix = (
-        args.dataset_mix or os.environ.get("TEUTONIC_DATASET_MIX", "")
-    ).strip()
-
     skip_shard_load = (
         (args.skip_scoring or args.from_iter >= 0) and args.eval_mode == "validator"
+        and not use_mixture
     )
 
     if skip_shard_load:
         log.info("skipping dataset shard load (skip_scoring/from_iter + validator eval)")
-    elif dataset_mix:
-        mix_cfg = load_mix_config(dataset_mix)
-        mix_cache_dir = Path(args.mix_shard_cache or work / "mix_cache")
-        mix_index = MixedDatasetIndex(mix_cfg, mix_cache_dir)
-        manifest = synthetic_manifest(mix_cfg)
-        log.info(
-            "dataset mode: mixed-v4 (%d sources, weights=%s)",
-            len(mix_cfg.datasets),
-            ", ".join(f"{d.name}={d.weight:.2f}" for d in mix_cfg.datasets),
+    elif use_mixture and mixture_cfg and mixture_store:
+        manifest = {
+            "version": "mixture-v2",
+            "preset": mixture_cfg.preset,
+            "seq_len": mixture_cfg.seq_len,
+            "datasets": [
+                {"name": s.name, "manifest_url": s.manifest_url, "weight": mixture_cfg.weights[s.name]}
+                for s in mixture_cfg.sources
+            ],
+        }
+        mixture_allocations = build_mixture_allocations(
+            mixture_cfg,
+            n_score=args.n_score,
+            train_per_iter=args.train_per_iter,
+            val_size=args.val_size,
+            n_eval=args.final_eval_n or args.n_eval,
         )
+        save_allocation_summary(work, mixture_allocations)
+        if args.eval_mode == "local":
+            mixture_eval_pools = prepare_mixture_eval_pools(
+                mixture_store,
+                mixture_cfg,
+                mixture_allocations["n_eval"],
+                args.seed,
+                args.mix_shards_per_dataset,
+            )
+            log.info(
+                "mixture eval pools: %s",
+                {k: len(v[1]) for k, v in mixture_eval_pools.items()},
+            )
     else:
         manifest = fetch_manifest(cache, args.local_dataset_manifest)
         dataset_mode = resolve_dataset_mode(args.dataset_mode, manifest, king_dir)
@@ -1865,19 +2185,26 @@ def main():
                          len(eval_arr), len(eval_indices))
 
     # ---- Score cache dir ----
-    score_cache_dir: Path | None = None
+    score_cache_dir_path: Path | None = None
     if args.use_local_score_cache:
         if args.score_cache_dir:
-            score_cache_dir = Path(args.score_cache_dir) / f"king_{king_hash[:16]}"
+            score_cache_dir_path = Path(args.score_cache_dir)
         elif mix_cfg is not None:
-            score_cache_dir = (
-                work / "score_cache" / f"king_{king_hash[:16]}"
-                / f"mix_{mix_config_hash(mix_cfg)[:8]}"
+            score_cache_dir_path = score_cache_dir(
+                work, king_hash, [], args.seq_len,
+                extra_tag=f"mix_{mix_config_hash(mix_cfg)[:8]}",
+            )
+        elif shard_keys:
+            score_cache_dir_path = score_cache_dir(
+                work, king_hash, shard_keys, args.seq_len,
             )
         else:
-            score_cache_dir = _score_cache_dir(work, king_hash, manifest)
-        score_cache_dir.mkdir(parents=True, exist_ok=True)
-        log.info("score cache dir: %s", score_cache_dir)
+            score_cache_dir_path = _score_cache_dir(work, king_hash, manifest)
+        score_cache_dir_path.mkdir(parents=True, exist_ok=True)
+        log.info("score cache dir: %s", score_cache_dir_path)
+
+    sweep_results_all: list[dict] = []
+    curriculum_stats: dict = {}
 
     # ---- Iteration loop ----
     best: dict | None = None
@@ -1927,6 +2254,8 @@ def main():
                     f"--skip-scoring set but {train_p} or {val_p} missing"
                 )
             if args.n_score == 0:
+                if use_mixture:
+                    raise RuntimeError("n_score=0 is not supported with mixture datasets")
                 if mix_index is not None:
                     raise RuntimeError(
                         "n_score=0 is not supported with --dataset-mix; use n_score > 0"
@@ -1938,6 +2267,15 @@ def main():
                     )
                 train_p, val_p = sample_direct_from_shards(
                     shards, args.train_per_iter, args.val_size, seed, iter_work,
+                )
+            elif use_mixture and mixture_store and mixture_cfg and mixture_allocations:
+                train_p, val_p, curriculum_stats = score_and_curate_mixture(
+                    str(king_dir), mixture_store, mixture_cfg, mixture_allocations,
+                    seed, "cuda:0", iter_work, king_hash,
+                    shards_per_dataset=args.mix_shards_per_dataset,
+                    force_rescore=args.force_rescore,
+                    max_suspicious_frac=args.max_suspicious_frac,
+                    use_score_cache=args.use_local_score_cache,
                 )
             else:
                 preset_cands: list[tuple[int, int]] | None = None
@@ -1969,13 +2307,17 @@ def main():
                     hard_frac=args.hard_frac,
                     easy_frac=args.easy_frac,
                     max_suspicious_frac=args.max_suspicious_frac,
-                    score_cache_path=score_cache_dir,
+                    score_cache_path=score_cache_dir_path,
                     force_rescore=args.force_rescore,
                     king_hash=king_hash,
                     preset_cands=preset_cands,
                 )
+            curriculum_path = iter_work / "curriculum.json"
+            if curriculum_path.is_file():
+                curriculum_stats = json.loads(curriculum_path.read_text())
 
         # --- Train ---
+        sweep_out = iter_work / "lora_sweep"
         if merge_only:
             ckpt = (args.resume_checkpoint or "").strip()
             if ckpt:
@@ -2010,31 +2352,114 @@ def main():
                         "chain training: adapter-only resume, lr=%g (base %g × ratio %g)",
                         chain_lr, args.lr, args.chain_lr_ratio,
                     )
-            if args.skip_scoring and it > 0 and train_p.exists():
-                log.warning(
-                    "iter %d: --skip-scoring reuses prior curriculum; "
-                    "re-score with higher --hard-frac for better raw Hippius gains",
-                    it,
+            if sweep_configs and not merge_only:
+                best_cfg, adapter, sweep_results = run_lora_sweep(
+                    str(king_dir), train_p, val_p, sweep_out, sweep_configs,
+                    args.n_gpus, args, Path(args.bundle),
+                    eval_arr=eval_arr,
+                    eval_indices=eval_indices,
+                    eval_batch_size=args.eval_batch_size,
+                    bootstrap=args.bootstrap,
+                    alpha=args.alpha,
+                    acceptance_lcb_floor=args.acceptance_lcb_floor,
+                    mean_delta_floor=args.mean_delta_floor,
+                    fast_eval_n=args.fast_eval_n or 512,
+                    mixture_eval_pools=mixture_eval_pools,
+                    mixture_weights=mixture_cfg.weights if mixture_cfg else None,
+                    regression_datasets=regression_datasets,
+                    regression_mu_floor=args.regression_mu_floor,
+                    regression_lcb_floor=args.regression_lcb_floor,
                 )
-            adapter = run_lora_training(
-                str(king_dir), train_p, val_p, out_dir,
-                args.n_gpus, args, Path(args.bundle),
-                resume_checkpoint=resume,
-                learning_rate=chain_lr,
-            )
+                sweep_results_all = sweep_results
+                best_mu = max(
+                    float(r.get("mu_hat") or -999) for r in sweep_results
+                )
+                best_lcb = max(
+                    float(r.get("lcb") or -999) for r in sweep_results
+                )
+                log.info(
+                    "sweep summary: best mu_hat=%.6f best lcb=%.6f across %d config(s)",
+                    best_mu, best_lcb, len(sweep_results),
+                )
+                if args.abort_if_mu_hat_nonpositive and best_mu <= 0:
+                    msg = (
+                        f"PROBE ABORT: best mixture mu_hat={best_mu:.6f} <= 0. "
+                        "Do not merge or scale up — change LoRA/data/curriculum first."
+                    )
+                    log.error(msg)
+                    abort_report = {
+                        "abort_reason": msg,
+                        "sweep_results": sweep_results,
+                        "best_mu_hat": best_mu,
+                        "best_lcb": best_lcb,
+                    }
+                    (iter_work / "probe_abort.json").write_text(
+                        json.dumps(abort_report, indent=2),
+                    )
+                    raise SystemExit(2)
+                best_link = out_dir / "best_adapter"
+                if best_link.exists():
+                    if best_link.is_symlink():
+                        best_link.unlink()
+                    else:
+                        shutil.rmtree(best_link)
+                shutil.copytree(str(adapter), str(best_link))
+                log.info("sweep best adapter copied to %s", best_link)
+            else:
+                adapter = run_lora_training(
+                    str(king_dir), train_p, val_p, out_dir,
+                    args.n_gpus, args, Path(args.bundle),
+                    resume_checkpoint=resume,
+                    learning_rate=chain_lr,
+                )
 
-        # --- Merge ---
-        if not merged_dir.exists() or not (merged_dir / "config.json").is_file():
+        # --- Merge (best only during sweep) ---
+        should_merge = (
+            not sweep_configs
+            or args.merge_best_only
+            or merge_only
+        )
+        if should_merge and (not merged_dir.exists() or not (merged_dir / "config.json").is_file()):
             merge_lora(
                 str(king_dir), adapter, merged_dir,
                 max_shard_size=(args.merge_max_shard_size or "").strip(),
             )
-        else:
+            hygiene_ok, hygiene_issues = validate_merged_model(merged_dir)
+            if not hygiene_ok:
+                log.warning("merged model hygiene issues: %s", hygiene_issues)
+        elif should_merge:
             log.info("merged model already at %s", merged_dir)
+        elif sweep_configs:
+            log.info("sweep mode: skipping merge until best candidate selected")
 
-        # --- Fast local eval (optional, uses holdout shard) ---
+        # --- Fast local eval (optional) ---
         fast_verdict: dict | None = None
-        if args.fast_eval and eval_arr is not None and eval_indices is not None:
+        if args.fast_eval and mixture_eval_pools and mixture_cfg:
+            log.info("fast mixture eval across %d datasets", len(mixture_eval_pools))
+            fast_verdict = mixture_weighted_paired_eval(
+                str(king_dir), str(merged_dir), mixture_eval_pools,
+                mixture_cfg.weights, "cuda:0",
+                batch_size=args.eval_batch_size,
+                n_bootstrap=args.bootstrap,
+                alpha=args.alpha,
+                acceptance_lcb_floor=args.acceptance_lcb_floor,
+                mean_delta_floor=args.mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+                regression_datasets=regression_datasets,
+                regression_mu_floor=args.regression_mu_floor,
+                regression_lcb_floor=args.regression_lcb_floor,
+            )
+            fast_verdict["phase"] = "fast_eval"
+            json.dump(fast_verdict, open(iter_work / "eval_fast.json", "w"), indent=2)
+            log.info(
+                "fast mixture eval: mu_hat=%.6f lcb=%.6f accepted=%s warnings=%d",
+                fast_verdict.get("mixture_mu_hat", 0),
+                fast_verdict.get("mixture_lcb", 0),
+                fast_verdict.get("accepted"),
+                len(fast_verdict.get("regression_warnings") or []),
+            )
+        elif args.fast_eval and eval_arr is not None and eval_indices is not None:
             fast_n = min(args.fast_eval_n, len(eval_indices))
             log.info("fast local eval: %d sequences", fast_n)
             fast_verdict = paired_eval(
@@ -2056,7 +2481,29 @@ def main():
             )
 
         # --- Final eval ---
-        if args.eval_mode == "validator":
+        verdict: dict | None = None
+        validator_verdict: dict | None = None
+
+        if args.dual_eval and mixture_eval_pools and mixture_cfg:
+            log.info("dual eval: mixture local (primary decision)")
+            verdict = mixture_weighted_paired_eval(
+                str(king_dir), str(merged_dir), mixture_eval_pools,
+                mixture_cfg.weights, "cuda:0",
+                batch_size=args.eval_batch_size,
+                n_bootstrap=args.bootstrap,
+                alpha=args.alpha,
+                acceptance_lcb_floor=args.acceptance_lcb_floor,
+                mean_delta_floor=args.mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+                regression_datasets=regression_datasets,
+                regression_mu_floor=args.regression_mu_floor,
+                regression_lcb_floor=args.regression_lcb_floor,
+            )
+            verdict["phase"] = "mixture_final"
+            json.dump(verdict, open(iter_work / "eval_mixture_final.json", "w"), indent=2)
+
+        if args.eval_mode == "validator" or args.dual_eval:
             _mining_dir = os.path.dirname(os.path.abspath(__file__))
             if _mining_dir not in sys.path:
                 sys.path.insert(0, _mining_dir)
@@ -2069,7 +2516,8 @@ def main():
                 [int(x) for x in args.eval_gpus.split(",") if x.strip()]
                 if args.eval_gpus else [0]
             )
-            verdict = validator_style_paired_eval(
+            log.info("running validator-style paired eval (n_public=%d)", args.n_eval)
+            validator_verdict = validator_style_paired_eval(
                 str(king_dir), str(merged_dir),
                 block_hash=block_hash, hotkey=hotkey,
                 n_public=args.n_eval, n_private=args.n_eval_private,
@@ -2080,10 +2528,9 @@ def main():
                 n_bootstrap=args.bootstrap,
                 vocab_size=vocab_size,
             )
-            # Apply mining-side acceptance floors on top of validator result
-            rejection_reasons = list(verdict.get("rejection_reasons") or [])
-            lcb = verdict.get("lcb", 0)
-            mu_hat = verdict.get("mu_hat", 0)
+            rejection_reasons = list(validator_verdict.get("rejection_reasons") or [])
+            lcb = validator_verdict.get("lcb", 0)
+            mu_hat = validator_verdict.get("mu_hat", 0)
             if lcb <= args.acceptance_lcb_floor:
                 rejection_reasons.append(
                     f"lcb={lcb:.6f} <= acceptance_lcb_floor={args.acceptance_lcb_floor}"
@@ -2093,24 +2540,49 @@ def main():
                     f"mu_hat={mu_hat:.6f} < mean_delta_floor={args.mean_delta_floor}"
                 )
             if rejection_reasons:
-                verdict["accepted"] = False
-            verdict["rejection_reasons"] = rejection_reasons
-            verdict["acceptance_lcb_floor"] = args.acceptance_lcb_floor
-            verdict["mean_delta_floor"] = args.mean_delta_floor
-        else:
-            if eval_arr is None or eval_indices is None:
-                raise RuntimeError("local eval requires eval_arr")
-            n_final = min(args.final_eval_n or args.n_eval, len(eval_indices))
-            log.info("final local eval: %d sequences", n_final)
-            verdict = paired_eval(
-                str(king_dir), str(merged_dir), eval_arr,
-                eval_indices[:n_final], "cuda:0",
-                batch_size=args.eval_batch_size,
-                n_bootstrap=args.bootstrap,
-                alpha=args.alpha,
-                acceptance_lcb_floor=args.acceptance_lcb_floor,
-                mean_delta_floor=args.mean_delta_floor,
-            )
+                validator_verdict["accepted"] = False
+            validator_verdict["rejection_reasons"] = rejection_reasons
+            validator_verdict["acceptance_lcb_floor"] = args.acceptance_lcb_floor
+            validator_verdict["mean_delta_floor"] = args.mean_delta_floor
+            validator_verdict["phase"] = "validator"
+            json.dump(validator_verdict, open(iter_work / "eval_validator.json", "w"), indent=2)
+            if verdict is None:
+                verdict = validator_verdict
+            else:
+                verdict["validator_eval"] = validator_verdict
+        elif verdict is None:
+            if mixture_eval_pools and mixture_cfg:
+                log.info("final mixture eval across %d datasets", len(mixture_eval_pools))
+                verdict = mixture_weighted_paired_eval(
+                    str(king_dir), str(merged_dir), mixture_eval_pools,
+                    mixture_cfg.weights, "cuda:0",
+                    batch_size=args.eval_batch_size,
+                    n_bootstrap=args.bootstrap,
+                    alpha=args.alpha,
+                    acceptance_lcb_floor=args.acceptance_lcb_floor,
+                    mean_delta_floor=args.mean_delta_floor,
+                    hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                    prepare_quasar_model=_prepare_quasar_model,
+                    regression_datasets=regression_datasets,
+                    regression_mu_floor=args.regression_mu_floor,
+                    regression_lcb_floor=args.regression_lcb_floor,
+                )
+            elif eval_arr is None or eval_indices is None:
+                raise RuntimeError("local eval requires eval_arr or mixture_eval_pools")
+            else:
+                n_final = min(args.final_eval_n or args.n_eval, len(eval_indices))
+                log.info("final local eval: %d sequences", n_final)
+                verdict = paired_eval(
+                    str(king_dir), str(merged_dir), eval_arr,
+                    eval_indices[:n_final], "cuda:0",
+                    batch_size=args.eval_batch_size,
+                    n_bootstrap=args.bootstrap,
+                    alpha=args.alpha,
+                    acceptance_lcb_floor=args.acceptance_lcb_floor,
+                    mean_delta_floor=args.mean_delta_floor,
+                )
+
+        assert verdict is not None
 
         verdict["iter"] = it
         verdict["seed"] = seed
@@ -2118,6 +2590,32 @@ def main():
         verdict["mean_delta"] = verdict.get("mu_hat", 0)
         if fast_verdict:
             verdict["fast_eval"] = fast_verdict
+        if sweep_results_all:
+            verdict["sweep_results"] = sweep_results_all
+
+        hygiene_ok, hygiene_issues = (
+            validate_merged_model(merged_dir)
+            if merged_dir.exists() else (False, ["merged dir missing"])
+        )
+        submit_decision, decision_reasons = pre_submit_decision(
+            lcb=float(verdict.get("lcb", 0)),
+            mu_hat=float(verdict.get("mu_hat", 0)),
+            n_eval=int(verdict.get("n_eval", 0)),
+            lcb_floor=args.acceptance_lcb_floor,
+            preferred_lcb_margin=args.preferred_lcb_margin,
+            preferred_mu_hat=args.preferred_mu_hat,
+            min_n_eval=args.min_final_n_eval,
+            merged_hygiene_ok=hygiene_ok if merged_dir.exists() else None,
+            mixture_lcb=verdict.get("mixture_lcb"),
+            mixture_mu_hat=verdict.get("mixture_mu_hat"),
+            regression_warnings=verdict.get("regression_warnings"),
+            block_on_regression=not args.no_block_on_regression,
+        )
+        verdict["submit_decision"] = submit_decision
+        verdict["decision_reasons"] = decision_reasons
+        verdict["merged_hygiene_ok"] = hygiene_ok
+        verdict["merged_hygiene_issues"] = hygiene_issues
+        print_submit_verdict(submit_decision, decision_reasons)
 
         json.dump(verdict, open(verdict_p, "w"), indent=2)
         history.append(verdict)
@@ -2144,11 +2642,32 @@ def main():
             (best_dir / "best_model_path.txt").write_text(best_merged)
 
     # ---- race_summary ----
-    race_summary = {
+    run_report = {
+        "chain_name": chain_config.NAME,
         "king_repo": king["hf_repo"],
         "king_revision": king.get("king_revision"),
-        "king_hash": king_hash,
-        "preset": args.candidate_preset,
+        "king_digest": king_hash,
+        "mode": args.mode or args.candidate_preset,
+        "candidate_preset": args.candidate_preset,
+        "dataset_preset": mixture_cfg.preset if mixture_cfg else ("legacy" if not use_mixture else ""),
+        "dataset_weights": mixture_cfg.weights if mixture_cfg else {},
+        "sample_allocations": mixture_allocations,
+        "dataset_shards_used": shard_keys,
+        "curriculum_stats": curriculum_stats,
+        "curriculum_per_dataset": curriculum_stats.get("per_dataset") if curriculum_stats else {},
+        "lora_configs_tested": sweep_results_all,
+        "paired_eval": best,
+        "per_dataset_eval": (best or {}).get("per_dataset") if best else {},
+        "mixture_eval": {
+            "mixture_mu_hat": (best or {}).get("mixture_mu_hat"),
+            "mixture_lcb": (best or {}).get("mixture_lcb"),
+            "regression_warnings": (best or {}).get("regression_warnings"),
+        } if best else {},
+        "validator_eval": (best or {}).get("validator_eval") if best else None,
+        "best_config": (
+            max(sweep_results_all, key=_sweep_rank_key)
+            if sweep_results_all else None
+        ),
         "lr": args.lr,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
@@ -2162,6 +2681,33 @@ def main():
         "n_iters_run": len(history),
         "best": best,
         "history": history,
+        "final_decision": best.get("submit_decision") if best else "DO_NOT_SUBMIT",
+        "decision_reasons": best.get("decision_reasons") if best else [],
+        "merged_model_path": best.get("merged_dir") if best else None,
+        "ts": time.time(),
+    }
+    save_run_report(work, run_report)
+
+    race_summary = {
+        "king_repo": king["hf_repo"],
+        "king_revision": king.get("king_revision"),
+        "king_hash": king_hash,
+        "preset": args.candidate_preset,
+        "mode": args.mode,
+        "lr": args.lr,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "epochs": args.epochs,
+        "general_frac": args.general_frac,
+        "hard_frac": args.hard_frac,
+        "easy_frac": args.easy_frac,
+        "n_score": args.n_score,
+        "train_per_iter": args.train_per_iter,
+        "val_size": args.val_size,
+        "n_iters_run": len(history),
+        "best": best,
+        "history": history,
+        "submit_decision": best.get("submit_decision") if best else None,
         "ts": time.time(),
     }
     json.dump(race_summary, open(work / "race_summary.json", "w"), indent=2)
@@ -2202,10 +2748,22 @@ def main():
         json.dump(final, open(args.report_out, "w"), indent=2)
         log.info("wrote verdict to %s", args.report_out)
 
-    # ---- HuggingFace Upload (optional) ----
-    if args.upload_repo and best and best.get("accepted"):
+    # ---- HuggingFace Upload (optional, requires explicit approval) ----
+    upload_allowed = (
+        args.upload_approved
+        and best
+        and best.get("submit_decision") == "READY_TO_UPLOAD"
+    )
+    if args.upload_repo and upload_allowed:
+        if args.coldkey_prefix:
+            ok, msg = validate_upload_repo(args.upload_repo, args.coldkey_prefix)
+            if not ok:
+                raise ValueError(msg)
         best_merged = best.get("merged_dir", best.get("iter_dir", ""))
         if best_merged and Path(best_merged).is_dir():
+            hygiene_ok, hygiene_issues = validate_merged_model(Path(best_merged))
+            if not hygiene_ok:
+                raise ValueError(f"upload blocked: merged model hygiene failed: {hygiene_issues}")
             log.info("uploading %s -> HF %s", best_merged, args.upload_repo)
             api = HfApi(token=args.hf_token)
             api.create_repo(args.upload_repo, exist_ok=True, private=False)
@@ -2237,7 +2795,12 @@ def main():
             if args.report_out:
                 json.dump(final, open(args.report_out, "w"), indent=2)
     elif args.upload_repo:
-        log.warning("not uploading: best=%s", best)
+        log.warning(
+            "not uploading: upload_approved=%s submit_decision=%s best=%s",
+            args.upload_approved,
+            best.get("submit_decision") if best else None,
+            bool(best),
+        )
 
     log.info(
         "DONE — best mu_hat=%.6f accepted=%s",

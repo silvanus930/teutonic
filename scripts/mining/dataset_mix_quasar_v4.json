@@ -1,4 +1,5 @@
 {
+  "preset": "teutonic-mixture-v2",
   "seq_len": 2048,
   "hippius_base": "https://s3.hippius.com/teutonic-sn3",
   "datasets": [

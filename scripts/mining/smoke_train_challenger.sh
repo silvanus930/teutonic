@@ -43,7 +43,13 @@ print('OK: all imports pass')
 
 # ---- Step 2: py_compile all changed scripts ----
 echo "[smoke] syntax-checking Python files..."
+python -m py_compile scripts/mining/dataset_mixture.py
 python -m py_compile scripts/mining/train_challenger.py
+python -m py_compile scripts/mining/cache_utils.py
+python -m py_compile scripts/mining/curriculum.py
+python -m py_compile scripts/mining/paired_eval.py
+python -m py_compile scripts/mining/reporting.py
+python -m py_compile scripts/mining/preflight.py
 python -m py_compile scripts/mining/retokenize_fineweb_edu_qwen.py
 python -m py_compile scripts/mining/validator_eval.py
 python -m py_compile scripts/mining/submit_challenger.py
@@ -83,6 +89,7 @@ python -u scripts/mining/train_challenger.py \
   --fast-eval-n 32 \
   --acceptance-lcb-floor 0.0 \
   --mean-delta-floor 0.0 \
+  --skip-chain-check \
   --report-out "${REPORT}" \
   --sim-hotkey "${HOTKEY}" \
   2>&1 | tee "${SMOKE_WORK}/smoke.log" || {

@@ -608,6 +608,7 @@ def main() -> None:
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "lora_dropout": args.lora_dropout,
+            "lora_config_label": f"r{args.lora_r}:a{args.lora_alpha}:lr{args.learning_rate:g}",
             "adam_beta2": args.adam_beta2,
             "micro_batch_size": args.micro_batch_size,
             "grad_accum": args.grad_accum,
