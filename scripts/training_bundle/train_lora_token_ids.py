@@ -40,6 +40,7 @@ if str(_mining) not in sys.path:
 from hf_king_compat import (  # noqa: E402
     default_lora_target_modules_for_king,
     hf_remote_code_kwargs,
+    load_king_tokenizer,
     patch_transformers_quasar_compat,
     prepare_quasar_model,
 )
@@ -264,6 +265,14 @@ def main() -> None:
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--learning-rate", type=float, default=5e-5)
     ap.add_argument("--epochs", type=float, default=1.5)
+    ap.add_argument(
+        "--max-steps", type=int, default=0,
+        help="Cap total optimizer steps (overrides epochs when > 0).",
+    )
+    ap.add_argument(
+        "--skip-trainer-eval", action="store_true",
+        help="Disable periodic validation during training (faster micro-screens).",
+    )
 
     # LR scheduler
     ap.add_argument(
@@ -333,9 +342,7 @@ def main() -> None:
 
     # ---- Model ----
     _king_kw = hf_remote_code_kwargs(args.base_model)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model, use_fast=True, **_king_kw,
-    )
+    tokenizer = load_king_tokenizer(args.base_model)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=eval_dtype,
@@ -399,10 +406,13 @@ def main() -> None:
         len(train_ds) / (args.micro_batch_size * world_size * args.grad_accum)
     )
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
     warmup_steps = (
         args.warmup_steps if args.warmup_steps > 0
         else int(total_steps * args.warmup_ratio)
     )
+    warmup_steps = min(warmup_steps, max(0, total_steps - 1))
     if is_main:
         print(
             f"[scheduler] type={args.lr_scheduler_type} total_steps={total_steps} "
@@ -446,33 +456,41 @@ def main() -> None:
         save_total_limit = 3
 
     # ---- TrainingArguments ----
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.micro_batch_size,
-        per_device_eval_batch_size=args.micro_batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.epochs,
-        warmup_steps=hf_warmup_steps,
-        warmup_ratio=0.0,
-        weight_decay=args.weight_decay,
-        max_grad_norm=args.max_grad_norm,
-        adam_beta2=args.adam_beta2,
-        lr_scheduler_type=hf_scheduler,
-        logging_steps=args.logging_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_steps=args.save_steps,
-        save_total_limit=save_total_limit,
-        bf16=use_bf16,
-        fp16=use_fp16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        report_to="none",
-        ddp_find_unused_parameters=False,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-    )
+    train_kw: dict = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.micro_batch_size,
+        "per_device_eval_batch_size": args.micro_batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "learning_rate": args.learning_rate,
+        "warmup_steps": hf_warmup_steps,
+        "warmup_ratio": 0.0,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "adam_beta2": args.adam_beta2,
+        "lr_scheduler_type": hf_scheduler,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_total_limit": save_total_limit,
+        "bf16": use_bf16,
+        "fp16": use_fp16,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "report_to": "none",
+        "ddp_find_unused_parameters": False,
+    }
+    if args.skip_trainer_eval:
+        train_kw["eval_strategy"] = "no"
+        train_kw["load_best_model_at_end"] = False
+    else:
+        train_kw["eval_strategy"] = "steps"
+        train_kw["eval_steps"] = args.eval_steps
+        train_kw["load_best_model_at_end"] = True
+        train_kw["metric_for_best_model"] = "eval_loss"
+        train_kw["greater_is_better"] = False
+    if args.max_steps > 0:
+        train_kw["max_steps"] = total_steps
+    else:
+        train_kw["num_train_epochs"] = args.epochs
+    training_args = TrainingArguments(**train_kw)
 
     trainer = Trainer(
         model=model,

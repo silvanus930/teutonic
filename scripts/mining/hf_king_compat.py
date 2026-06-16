@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json")
 
 def ensure_quasar_arch_registered() -> None:
     """Register vendored Quasar for quasar_text checkpoints (no trust_remote_code)."""
@@ -134,6 +139,84 @@ def hf_remote_code_kwargs(model_path: str) -> dict:
     if s not in sys.path:
         sys.path.insert(0, s)
     return {"trust_remote_code": True}
+
+
+def _king_vocab_size(model_path: Path) -> int | None:
+    cfg_path = model_path / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        return int(json.loads(cfg_path.read_text()).get("vocab_size") or 0) or None
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _tokenizer_fallback_dir(king_dir: Path) -> Path | None:
+    explicit = (os.environ.get("TEUTONIC_TOKENIZER_DIR") or "").strip()
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if (p / "tokenizer.json").is_file():
+            return p
+        raise FileNotFoundError(
+            f"TEUTONIC_TOKENIZER_DIR={p} has no tokenizer.json"
+        )
+
+    king_vocab = _king_vocab_size(king_dir)
+    candidates: list[Path] = []
+    for parent in (king_dir.parent, king_dir.parent.parent):
+        if not parent.is_dir():
+            continue
+        for child in sorted(parent.iterdir()):
+            if not child.is_dir() or child.resolve() == king_dir.resolve():
+                continue
+            if not (child / "tokenizer.json").is_file():
+                continue
+            if king_vocab is not None:
+                child_vocab = _king_vocab_size(child)
+                if child_vocab is not None and child_vocab != king_vocab:
+                    continue
+            candidates.append(child)
+    return candidates[0] if candidates else None
+
+
+def ensure_king_tokenizer_files(model_path: str) -> Path:
+    """Ensure tokenizer.json exists beside king weights (many Hippius kings omit it)."""
+    king_dir = Path(model_path).expanduser().resolve()
+    if (king_dir / "tokenizer.json").is_file():
+        return king_dir
+
+    fallback = _tokenizer_fallback_dir(king_dir)
+    if fallback is None:
+        raise FileNotFoundError(
+            f"{king_dir} has no tokenizer.json (required for LoRA training).\n"
+            "  Hippius king artifacts often omit tokenizer files. Fix options:\n"
+            f"    export TEUTONIC_TOKENIZER_DIR=/path/to/dir/with/tokenizer.json\n"
+            f"    cp /root/teutonic/s1-work/king1/tokenizer*.json {king_dir}/\n"
+            "  Or add tokenizer.json to your hippius-hub download list."
+        )
+
+    for name in _TOKENIZER_FILES:
+        src = fallback / name
+        if src.is_file() and not (king_dir / name).is_file():
+            shutil.copy2(src, king_dir / name)
+            log.info("copied king tokenizer %s from %s -> %s", name, fallback, king_dir)
+    if not (king_dir / "tokenizer.json").is_file():
+        raise FileNotFoundError(
+            f"tokenizer fallback {fallback} has no tokenizer.json"
+        )
+    return king_dir
+
+
+def load_king_tokenizer(model_path: str):
+    """Load tokenizer for a local king; copies fallback files if needed."""
+    from transformers import AutoTokenizer
+
+    king_dir = ensure_king_tokenizer_files(model_path)
+    kw = hf_remote_code_kwargs(str(king_dir))
+    try:
+        return AutoTokenizer.from_pretrained(str(king_dir), use_fast=True, **kw)
+    except (ValueError, OSError):
+        return AutoTokenizer.from_pretrained(str(king_dir), use_fast=False, **kw)
 
 
 _QUASAR_LORA_TARGETS = (

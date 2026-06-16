@@ -18,14 +18,26 @@ EVAL_DELTA = 0.0025
 LM_HEAD_CHUNK = 256
 
 
+def _backbone_and_lm_head(model):
+    """Return (backbone, lm_head) for CausalLM or PeftModel.
+
+    PeftModel.model is the LoRA wrapper; model.model is the full CausalLM and
+    would materialize vocab-sized logits on forward — use the inner backbone.
+    """
+    if isinstance(model, PeftModel):
+        causal_lm = model.base_model.model
+        return causal_lm.model, causal_lm.lm_head
+    return model.model, model.lm_head
+
+
 @torch.no_grad()
 def compute_per_seq_loss(model, token_batches, device, chunk: int = LM_HEAD_CHUNK) -> list[float]:
     input_ids = torch.tensor(token_batches, dtype=torch.long, device=device).contiguous()
     if hasattr(model, "reset_state"):
         model.reset_state()
-    out = model.model(input_ids)
+    backbone, lm_head = _backbone_and_lm_head(model)
+    out = backbone(input_ids)
     hidden = out.last_hidden_state
-    lm_head = model.lm_head
     n_pos = input_ids.size(1) - 1
     total = torch.zeros(len(token_batches), device=device)
     for i in range(0, n_pos, chunk):
@@ -116,6 +128,28 @@ def paired_eval_merged(
     )
 
 
+def _load_adapter_model(
+    king_dir: str,
+    adapter_dir: str,
+    device: str,
+    hf_remote_code_kwargs,
+    prepare_quasar_model,
+):
+    base = AutoModelForCausalLM.from_pretrained(
+        king_dir,
+        torch_dtype=torch.bfloat16,
+        device_map={"": device},
+        use_safetensors=True,
+        **hf_remote_code_kwargs(king_dir),
+    )
+    prepare_quasar_model(base)
+    if hasattr(base, "config"):
+        base.config.use_cache = True
+    chall = PeftModel.from_pretrained(base, str(adapter_dir))
+    chall.eval()
+    return chall
+
+
 def paired_eval_adapter(
     king_dir: str,
     adapter_dir: str,
@@ -135,18 +169,9 @@ def paired_eval_adapter(
     adapter_path = Path(adapter_dir)
     log.info("paired_eval_adapter: king=%s adapter=%s device=%s", king_dir, adapter_dir, device)
     king = _load_model(king_dir, device, hf_remote_code_kwargs, prepare_quasar_model)
-    base = AutoModelForCausalLM.from_pretrained(
-        king_dir,
-        torch_dtype=torch.bfloat16,
-        device_map={"": device},
-        use_safetensors=True,
-        **hf_remote_code_kwargs(king_dir),
+    chall = _load_adapter_model(
+        king_dir, str(adapter_path), device, hf_remote_code_kwargs, prepare_quasar_model,
     )
-    prepare_quasar_model(base)
-    if hasattr(base, "config"):
-        base.config.use_cache = True
-    chall = PeftModel.from_pretrained(base, str(adapter_path))
-    chall.eval()
     return _run_paired_loop(
         king, chall, shard, indices, device,
         batch_size=batch_size,
@@ -369,6 +394,45 @@ def mixture_weighted_paired_eval(
     }
 
 
+def subsample_mixture_eval_pools(
+    eval_pools: dict[str, tuple[np.ndarray, list[int]]],
+    weights: dict[str, float],
+    n_total: int,
+    *,
+    seed: int = 42,
+) -> dict[str, tuple[np.ndarray, list[int]]]:
+    """Return mixture eval pools capped at n_total indices (weighted per dataset)."""
+    if n_total <= 0:
+        return eval_pools
+    active = {
+        name: (shard, indices)
+        for name, (shard, indices) in eval_pools.items()
+        if indices and weights.get(name, 0.0) > 0
+    }
+    if not active:
+        return eval_pools
+    total_w = sum(float(weights.get(name, 0.0)) for name in active)
+    rng = np.random.default_rng(seed)
+    out: dict[str, tuple[np.ndarray, list[int]]] = {}
+    remaining = n_total
+    names = list(active.keys())
+    for i, name in enumerate(names):
+        shard, indices = active[name]
+        w = float(weights.get(name, 0.0)) / total_w
+        if i == len(names) - 1:
+            n_pick = remaining
+        else:
+            n_pick = max(1, int(round(n_total * w)))
+            n_pick = min(n_pick, remaining, len(indices))
+        remaining -= n_pick
+        if n_pick >= len(indices):
+            picked = list(indices)
+        else:
+            picked = rng.choice(indices, size=n_pick, replace=False).tolist()
+        out[name] = (shard, picked)
+    return out
+
+
 def _collect_diffs(king, chall, shard, indices, device, batch_size) -> list[float]:
     diffs: list[float] = []
     for i in range(0, len(indices), batch_size):
@@ -399,19 +463,10 @@ def mixture_weighted_paired_eval_adapter(
     regression_lcb_floor: float = -0.001,
 ) -> dict:
     """Mixture eval with LoRA adapter (no merge)."""
-    from peft import PeftModel
-
     king = _load_model(king_dir, device, hf_remote_code_kwargs, prepare_quasar_model)
-    base = AutoModelForCausalLM.from_pretrained(
-        king_dir,
-        torch_dtype=torch.bfloat16,
-        device_map={"": device},
-        use_safetensors=True,
-        **hf_remote_code_kwargs(king_dir),
+    chall = _load_adapter_model(
+        king_dir, str(adapter_dir), device, hf_remote_code_kwargs, prepare_quasar_model,
     )
-    prepare_quasar_model(base)
-    chall = PeftModel.from_pretrained(base, str(adapter_dir))
-    chall.eval()
 
     per_dataset: dict[str, dict] = {}
     pooled_diffs: list[float] = []
@@ -449,7 +504,7 @@ def mixture_weighted_paired_eval_adapter(
                 regression_warnings.append(msg)
                 log.warning(msg)
 
-    del king, chall, base
+    del king, chall
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

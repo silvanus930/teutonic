@@ -95,6 +95,7 @@ class MixtureConfig:
     sources: tuple[DatasetSource, ...]
     weights: dict[str, float]
     bucket_mix: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    local_shards_only: bool = False
 
 
 def hippius_base_from_url(manifest_url: str) -> str:
@@ -185,6 +186,7 @@ def build_mixture_config(
     dataset_names: list[str] | None = None,
     mix_json_path: str = "",
     bucket_mix_overrides: dict[str, tuple[float, float, float]] | None = None,
+    local_shards_only: bool = False,
 ) -> MixtureConfig | None:
     """Return MixtureConfig for mixture presets, or None for legacy single-manifest mode."""
     if preset == "legacy":
@@ -260,6 +262,7 @@ def build_mixture_config(
         sources=tuple(sources),
         weights=norm_weights,
         bucket_mix=bucket_mix,
+        local_shards_only=local_shards_only,
     )
 
 
@@ -282,24 +285,44 @@ def resolve_shard_url(shard_key: str, hippius_base: str) -> str:
     return f"{hippius_base.rstrip('/')}/{key.lstrip('/')}"
 
 
+def shard_cache_path(source: DatasetSource, shard_key: str) -> Path:
+    """On-disk path for a mixture shard (matches download_dataset / train_challenger)."""
+    key_hash = hashlib.sha256(shard_key.encode()).hexdigest()[:16]
+    name = Path(shard_key).name or "shard.npy"
+    return source.shard_cache_dir / f"{key_hash}_{name}"
+
+
+def is_shard_cached(source: DatasetSource, shard_key: str) -> bool:
+    local_path = Path(shard_key)
+    if local_path.is_file() and local_path.stat().st_size > 1024:
+        return True
+    out = shard_cache_path(source, shard_key)
+    return out.is_file() and out.stat().st_size > 1024
+
+
 def download_shard_cached(
     source: DatasetSource, shard_key: str, *, force: bool = False,
+    local_only: bool = False,
 ) -> Path:
     local_path = Path(shard_key)
     if local_path.is_file() and local_path.stat().st_size > 1024:
         return local_path
 
     source.shard_cache_dir.mkdir(parents=True, exist_ok=True)
-    key_hash = hashlib.sha256(shard_key.encode()).hexdigest()[:16]
-    name = Path(shard_key).name or "shard.npy"
-    out = source.shard_cache_dir / f"{key_hash}_{name}"
+    out = shard_cache_path(source, shard_key)
     if out.is_file() and out.stat().st_size > 1024:
         if not force:
             return out
         out.unlink()
 
+    if local_only:
+        raise FileNotFoundError(
+            f"local-shards-only: missing cached shard for {source.name}: "
+            f"{Path(shard_key).name} (expected {out})"
+        )
+
     url = resolve_shard_url(shard_key, source.hippius_base)
-    log.info("downloading %s shard %s", source.name, name)
+    log.info("downloading %s shard %s", source.name, Path(shard_key).name)
     subprocess.check_call(["curl", "-fsSL", "-o", str(out), url])
     return out
 
@@ -340,6 +363,21 @@ class MixtureShardStore:
     ) -> list[tuple[str, int]]:
         rng = np.random.default_rng(seed)
         entries = self._shard_meta[dataset_name]
+        if self.cfg.local_shards_only:
+            source = next(s for s in self.cfg.sources if s.name == dataset_name)
+            cached = [(key, n) for key, n in entries if is_shard_cached(source, key)]
+            if not cached:
+                raise RuntimeError(
+                    f"local-shards-only: no cached shards for {dataset_name} "
+                    f"under {source.shard_cache_dir}"
+                )
+            entries = cached
+            if len(entries) < shards_per_dataset:
+                log.warning(
+                    "local-shards-only: %s has %d cached shard(s), fewer than "
+                    "mix-shards-per-dataset=%d — using all cached",
+                    dataset_name, len(entries), shards_per_dataset,
+                )
         n_pick = min(max(1, shards_per_dataset), len(entries))
         pick = rng.choice(len(entries), size=n_pick, replace=False)
         return [entries[int(i)] for i in pick]
@@ -363,7 +401,9 @@ class MixtureShardStore:
 
     def _load_key(self, shard_key: str) -> None:
         source = self._source_for_key(shard_key)
-        path = download_shard_cached(source, shard_key)
+        path = download_shard_cached(
+            source, shard_key, local_only=self.cfg.local_shards_only,
+        )
         arr = load_shard_array(path, self.cfg.seq_len)
         self._arrays[shard_key] = arr
         if shard_key not in self._key_to_local:
@@ -520,9 +560,7 @@ def _shard_download_status(
     if local_path.is_file() and local_path.stat().st_size > 1024:
         return "cached", local_path
 
-    key_hash = hashlib.sha256(shard_key.encode()).hexdigest()[:16]
-    name = Path(shard_key).name or "shard.npy"
-    out = source.shard_cache_dir / f"{key_hash}_{name}"
+    out = shard_cache_path(source, shard_key)
     if out.is_file() and out.stat().st_size > 1024 and not force:
         return "cached", out
     return "pending", out

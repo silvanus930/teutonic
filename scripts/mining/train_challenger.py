@@ -15,7 +15,8 @@ Pipeline:
   5. Build a curriculum (general / hard / easy buckets, drop suspicious).
        Fractions: --general-frac --hard-frac --easy-frac (default 60/30/10).
   6. Train LoRA adapter(s) with optional --lora-sweep (adapter eval before merge).
-       Modes: --mode {fast,strong} for preset sweeps.
+       Modes: --mode {fast,probe,micro,strong} for preset sweeps.
+       --micro-screen: short train + quick μ̂ ranking, then full train top-k only.
   7. Merge only the best LoRA candidate after sweep.
   8. Offline paired eval candidate vs king on held-out shard slice
      (adapter-first during sweep; merged model for final eval).
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import hashlib
 import io
 import json
@@ -67,6 +69,7 @@ from dataset_mix import (  # noqa: E402
 from hf_king_compat import (  # noqa: E402
     default_lora_target_modules_for_king,
     ensure_quasar_arch_registered,
+    ensure_king_tokenizer_files,
     hf_remote_code_kwargs as _hf_remote_code_kwargs,
     prepare_quasar_model as _prepare_quasar_model,
     king_subprocess_env,
@@ -97,6 +100,7 @@ from dataset_mixture import (  # noqa: E402
     MixtureShardStore,
     build_mixture_allocations,
     build_mixture_config,
+    is_shard_cached,
     parse_bucket_mix_arg,
     parse_dataset_manifest_arg,
     parse_dataset_weight_arg,
@@ -110,6 +114,7 @@ from paired_eval import (  # noqa: E402
     mixture_weighted_paired_eval_adapter,
     paired_eval_adapter,
     paired_eval_merged,
+    subsample_mixture_eval_pools,
 )
 from preflight import (  # noqa: E402
     check_chain_match,
@@ -186,6 +191,28 @@ MODE_PRESETS: dict[str, dict] = {
             "r64:a128:lr1e-4:d0.05:e0.5",
         ],
         "abort_if_mu_hat_nonpositive": True,
+        "max_iters": 1,
+    },
+    "micro": {
+        "dataset_preset": "teutonic-mixture-v2",
+        "eval_mode": "local",
+        "n_score": 5000,
+        "train_per_iter": 4000,
+        "val_size": 400,
+        "n_eval": 1000,
+        "epochs": 0.5,
+        "lora_dropout": 0.05,
+        "fast_eval": True,
+        "fast_eval_n": 1000,
+        "final_eval_n": 1000,
+        "lora_sweep": [
+            "r32:a64:lr2e-4:d0.05:e0.5",
+            "r32:a64:lr3e-4:d0.05:e0.5",
+            "r64:a128:lr1e-4:d0.05:e0.5",
+            "r64:a128:lr2e-4:d0.05:e0.5",
+            "r128:a256:lr8e-5:d0.05:e0.5",
+        ],
+        "abort_if_mu_hat_nonpositive": False,
         "max_iters": 1,
     },
     "strong": {
@@ -657,6 +684,17 @@ def sha256_dir(path: Path) -> str:
     return h.hexdigest()
 
 
+def release_gpu_memory() -> None:
+    """Return cached VRAM before spawning a subprocess that loads the king again."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
 def manifest_hash(manifest: dict) -> str:
     """Stable hash of the manifest shard keys for score cache keying."""
     h = hashlib.sha256()
@@ -705,6 +743,64 @@ def _save_score_cache(cache_dir: Path, shard_keys: list[str], rows: list[dict]) 
     save_score_cache(cache_dir, shard_keys, rows, include_input_ids=True)
 
 
+SCORE_BATCH_SIZE = 8
+
+
+def _forward_score_candidates(
+    model,
+    shards: list[np.ndarray],
+    cands: list[tuple[int, int]],
+    device: str,
+    *,
+    batch_size: int = SCORE_BATCH_SIZE,
+    log_every_batches: int = 10,
+    label: str = "scoring",
+    t0: float | None = None,
+) -> list[dict]:
+    """Run king forward passes; emit progress every N batches (and at least every 60s)."""
+    if t0 is None:
+        t0 = time.time()
+    rows: list[dict] = []
+    log_every = max(1, log_every_batches)
+    n_batches = max(1, (len(cands) + batch_size - 1) // batch_size)
+    last_log_t = t0
+    for batch_i, i in enumerate(range(0, len(cands), batch_size)):
+        chunk = cands[i:i + batch_size]
+        toks = [shards[s][j].tolist() for s, j in chunk]
+        losses = compute_per_seq_loss(model, toks, device)
+        for (s_idx, j), tok, loss in zip(chunk, toks, losses):
+            arr = np.asarray(tok)
+            unique_r = float(len(set(tok)) / max(1, len(tok)))
+            rep_r = float(np.mean(arr[1:] == arr[:-1])) if len(arr) > 1 else 0.0
+            ngrams = [tuple(tok[k:k + 4]) for k in range(len(tok) - 3)]
+            rep_ng = 1.0 - len(set(ngrams)) / max(1, len(ngrams)) if ngrams else 0.0
+            rows.append({
+                "shard": s_idx,
+                "idx": j,
+                "loss": float(loss),
+                "unique_r": unique_r,
+                "rep_r": rep_r,
+                "rep_ng4": rep_ng,
+                "input_ids": tok,
+            })
+        now = time.time()
+        done = min(i + batch_size, len(cands))
+        at_batch_boundary = batch_i % log_every == 0
+        at_end = i + batch_size >= len(cands)
+        if at_batch_boundary or at_end or (now - last_log_t) >= 60.0:
+            run_losses = np.asarray([r["loss"] for r in rows])
+            ls = _loss_summary(run_losses)
+            log.info(
+                "%s %d/%d (%.1f%%) batch %d/%d | mean=%.4f p50=%.4f | %.1fs",
+                label, done, len(cands), 100.0 * done / max(1, len(cands)),
+                batch_i + 1, n_batches,
+                ls.get("mean", float("nan")), ls.get("p50", float("nan")),
+                now - t0,
+            )
+            last_log_t = now
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Score + curriculum  (lightweight — no tokens stored in rows)
 # ---------------------------------------------------------------------------
@@ -727,6 +823,7 @@ def score_and_curate(
     force_rescore: bool = False,
     king_hash: str = "",
     preset_cands: list[tuple[int, int]] | None = None,
+    score_log_every: int = 10,
 ) -> tuple[Path, Path]:
     """Score n_score random samples on the king, build curriculum, write train/val jsonl.
 
@@ -779,41 +876,16 @@ def score_and_curate(
             log.info("quasar compat: using PyTorch conv fallback on %d layer(s)", n_quasar)
         model.eval()
 
-        rows: list[dict] = []
-        BATCH = 8
-        log_every = max(1, len(cands) // (BATCH * 10))
-        for batch_i, i in enumerate(range(0, len(cands), BATCH)):
-            chunk = cands[i:i + BATCH]
-            toks = [shards[s][j].tolist() for s, j in chunk]
-            losses = compute_per_seq_loss(model, toks, device)
-            for (s_idx, j), tok, loss in zip(chunk, toks, losses):
-                arr = np.asarray(tok)
-                unique_r = float(len(set(tok)) / max(1, len(tok)))
-                rep_r = float(np.mean(arr[1:] == arr[:-1])) if len(arr) > 1 else 0.0
-                ngrams = [tuple(tok[k:k + 4]) for k in range(len(tok) - 3)]
-                rep_ng = 1.0 - len(set(ngrams)) / max(1, len(ngrams)) if ngrams else 0.0
-                rows.append({
-                    "shard": s_idx,
-                    "idx": j,
-                    "loss": float(loss),
-                    "unique_r": unique_r,
-                    "rep_r": rep_r,
-                    "rep_ng4": rep_ng,
-                    "input_ids": tok,
-                })
-            if batch_i % log_every == 0 or i + BATCH >= len(cands):
-                done = min(i + BATCH, len(cands))
-                run_losses = np.asarray([r["loss"] for r in rows])
-                ls = _loss_summary(run_losses)
-                log.info(
-                    "scoring %d/%d (%.1f%%) | mean=%.4f p50=%.4f | %.1fs",
-                    done, len(cands), 100.0 * done / max(1, len(cands)),
-                    ls.get("mean", float("nan")), ls.get("p50", float("nan")),
-                    time.time() - t_score,
-                )
+        rows = _forward_score_candidates(
+            model, shards, cands, device,
+            batch_size=SCORE_BATCH_SIZE,
+            log_every_batches=score_log_every,
+            label="scoring",
+            t0=t_score,
+        )
 
         del model
-        torch.cuda.empty_cache()
+        release_gpu_memory()
         log.info("scoring done in %.1fs (%d rows)", time.time() - t_score, len(rows))
 
         if score_cache_path:
@@ -889,6 +961,9 @@ def _score_dataset_candidates(
     device: str,
     score_cache_path: Path | None,
     force_rescore: bool,
+    *,
+    score_log_every: int = 10,
+    label: str = "scoring",
 ) -> list[dict]:
     sampled_keys = [shard_keys[i] for i in sorted({s for s, _ in cands})]
     cached_rows: list[dict] | None = None
@@ -896,36 +971,35 @@ def _score_dataset_candidates(
         cached_rows = _load_score_cache(score_cache_path, sampled_keys)
 
     if cached_rows is not None:
+        log.info("%s: score cache hit (%d rows, %d shard(s))", label, len(cached_rows), len(sampled_keys))
         rows = cached_rows
         for r in rows:
             if "row_idx" in r and "idx" not in r:
                 r["idx"] = r["row_idx"]
     else:
+        t_score = time.time()
+        log.info(
+            "%s: loading king on %s (%d candidates, batch=%d, log_every=%d batches)",
+            label, device, len(cands), SCORE_BATCH_SIZE, score_log_every,
+        )
         model = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
             use_safetensors=True, **_hf_remote_code_kwargs(king_dir),
         )
-        _prepare_quasar_model(model)
+        n_quasar = _prepare_quasar_model(model)
+        if n_quasar:
+            log.info("%s: quasar PyTorch conv fallback on %d layer(s)", label, n_quasar)
         model.eval()
-        rows = []
-        batch = 8
-        for i in range(0, len(cands), batch):
-            chunk = cands[i:i + batch]
-            toks = [shards[s][j].tolist() for s, j in chunk]
-            losses = compute_per_seq_loss(model, toks, device)
-            for (s_idx, j), tok, loss in zip(chunk, toks, losses):
-                arr = np.asarray(tok)
-                unique_r = float(len(set(tok)) / max(1, len(tok)))
-                rep_r = float(np.mean(arr[1:] == arr[:-1])) if len(arr) > 1 else 0.0
-                ngrams = [tuple(tok[k:k + 4]) for k in range(len(tok) - 3)]
-                rep_ng = 1.0 - len(set(ngrams)) / max(1, len(ngrams)) if ngrams else 0.0
-                rows.append({
-                    "shard": s_idx, "idx": j, "loss": float(loss),
-                    "unique_r": unique_r, "rep_r": rep_r, "rep_ng4": rep_ng,
-                    "input_ids": tok,
-                })
+        rows = _forward_score_candidates(
+            model, shards, cands, device,
+            batch_size=SCORE_BATCH_SIZE,
+            log_every_batches=score_log_every,
+            label=label,
+            t0=t_score,
+        )
         del model
-        torch.cuda.empty_cache()
+        release_gpu_memory()
+        log.info("%s done in %.1fs (%d rows)", label, time.time() - t_score, len(rows))
         if score_cache_path:
             _save_score_cache(score_cache_path, sampled_keys, rows)
 
@@ -949,6 +1023,7 @@ def score_and_curate_mixture(
     force_rescore: bool = False,
     max_suspicious_frac: float = 0.0,
     use_score_cache: bool = True,
+    score_log_every: int = 10,
 ) -> tuple[Path, Path, dict]:
     """Score and build curriculum across weighted mixture datasets."""
     rows_by_dataset: dict[str, list[dict]] = {}
@@ -975,6 +1050,8 @@ def score_and_curate_mixture(
         rows = _score_dataset_candidates(
             king_dir, store.arrays, store.keys, cands, device,
             cache_dir, force_rescore,
+            score_log_every=score_log_every,
+            label=f"mixture scoring {source.name}",
         )
         for r in rows:
             r["dataset"] = source.name
@@ -1005,6 +1082,7 @@ def score_and_curate_mixture(
         "mixture curriculum: train=%d val=%d across %d datasets",
         len(train_rows), len(val_rows), len(rows_by_dataset),
     )
+    release_gpu_memory()
     return train_p, val_p, curriculum_summary
 
 
@@ -1017,6 +1095,12 @@ def run_lora_training(
     bundle: Path,
     resume_checkpoint: str = "",
     learning_rate: float | None = None,
+    *,
+    epochs: float | None = None,
+    max_steps: int = 0,
+    save_steps: int | None = None,
+    eval_steps: int | None = None,
+    skip_trainer_eval: bool = False,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -1030,7 +1114,7 @@ def run_lora_training(
         "--micro-batch-size", str(args.micro_batch),
         "--grad-accum", str(args.grad_accum),
         "--learning-rate", str(learning_rate if learning_rate is not None else args.lr),
-        "--epochs", str(args.epochs),
+        "--epochs", str(epochs if epochs is not None else args.epochs),
         "--lora-r", str(args.lora_r),
         "--lora-alpha", str(args.lora_alpha),
         "--lora-dropout", str(args.lora_dropout),
@@ -1043,11 +1127,15 @@ def run_lora_training(
         "--max-grad-norm", str(args.max_grad_norm),
         "--dtype", args.dtype,
         "--logging-steps", str(args.logging_steps),
-        "--save-steps", str(args.save_steps),
-        "--eval-steps", str(args.eval_steps),
+        "--save-steps", str(save_steps if save_steps is not None else args.save_steps),
+        "--eval-steps", str(eval_steps if eval_steps is not None else args.eval_steps),
         "--lr-scheduler-type", args.lr_scheduler_type,
         "--average-top-k-lora-checkpoints", str(args.average_top_k_lora_checkpoints),
     ]
+    if max_steps > 0:
+        cmd.extend(["--max-steps", str(max_steps)])
+    if skip_trainer_eval:
+        cmd.append("--skip-trainer-eval")
     if args.lora_target_modules:
         cmd.extend(["--lora-target-modules", args.lora_target_modules])
     if args.gradient_checkpointing:
@@ -1058,6 +1146,7 @@ def run_lora_training(
     if resume:
         cmd.extend(["--resume-from-checkpoint", resume])
     log.info("training: %s", " ".join(cmd))
+    release_gpu_memory()
     t0 = time.time()
     subprocess.check_call(cmd, env=king_subprocess_env(base_model))
     log.info("training done in %.1fs", time.time() - t0)
@@ -1070,6 +1159,162 @@ def run_lora_training(
         else:
             raise RuntimeError(f"no adapter found in {out_dir}")
     return adapter
+
+
+def run_micro_screen_sweep(
+    base_model: str,
+    train_p: Path,
+    val_p: Path,
+    screen_out: Path,
+    sweep_configs: list[LoRASweepConfig],
+    n_gpus: int,
+    args: argparse.Namespace,
+    bundle: Path,
+    *,
+    eval_arr: np.ndarray | None,
+    eval_indices: list[int] | None,
+    eval_batch_size: int,
+    bootstrap: int,
+    alpha: float,
+    acceptance_lcb_floor: float,
+    mean_delta_floor: float,
+    fast_eval_n: int,
+    mixture_eval_pools: dict[str, tuple[np.ndarray, list[int]]] | None = None,
+    mixture_weights: dict[str, float] | None = None,
+    regression_datasets: tuple[str, ...] = (),
+    regression_mu_floor: float = -0.001,
+    regression_lcb_floor: float = -0.001,
+    max_steps: int = 50,
+    eval_n: int = 256,
+    force_rescreen: bool = False,
+) -> list[dict]:
+    """Quick train + subsampled paired eval to rank LoRA configs before full runs."""
+    screen_out.mkdir(parents=True, exist_ok=True)
+    screen_pools = mixture_eval_pools
+    if mixture_eval_pools and mixture_weights and eval_n > 0:
+        screen_pools = subsample_mixture_eval_pools(
+            mixture_eval_pools, mixture_weights, eval_n, seed=args.seed,
+        )
+        log.info(
+            "micro-screen eval pools: %s (cap=%d)",
+            {k: len(v[1]) for k, v in screen_pools.items()}, eval_n,
+        )
+
+    results: list[dict] = []
+    for cfg in sweep_configs:
+        log.info(
+            "=== micro-screen: %s (r=%d a=%d lr=%g, max_steps=%d) ===",
+            cfg.label, cfg.lora_r, cfg.lora_alpha, cfg.lr, max_steps,
+        )
+        cfg_out = screen_out / cfg.label
+        screen_result_path = cfg_out / "screen_result.json"
+        if screen_result_path.is_file() and not force_rescreen:
+            entry = json.loads(screen_result_path.read_text())
+            log.info(
+                "micro-screen %s: reusing mu_hat=%s lcb=%s",
+                cfg.label, entry.get("mu_hat"), entry.get("lcb"),
+            )
+            results.append(entry)
+            continue
+
+        cfg_args = argparse.Namespace(**vars(args))
+        cfg_args.lora_r = cfg.lora_r
+        cfg_args.lora_alpha = cfg.lora_alpha
+        cfg_args.lr = cfg.lr
+        if cfg.lora_dropout is not None:
+            cfg_args.lora_dropout = cfg.lora_dropout
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        release_gpu_memory()
+        t0 = time.time()
+        adapter = run_lora_training(
+            base_model, train_p, val_p, cfg_out,
+            n_gpus, cfg_args, bundle,
+            max_steps=max_steps,
+            save_steps=max(max_steps, 10_000),
+            eval_steps=max(max_steps, 10_000),
+            skip_trainer_eval=True,
+        )
+        train_elapsed = time.time() - t0
+
+        release_gpu_memory()
+        paired: dict | None = None
+        if screen_pools and mixture_weights:
+            paired = mixture_weighted_paired_eval_adapter(
+                base_model, str(adapter), screen_pools, mixture_weights, "cuda:0",
+                batch_size=eval_batch_size,
+                n_bootstrap=bootstrap,
+                alpha=alpha,
+                acceptance_lcb_floor=acceptance_lcb_floor,
+                mean_delta_floor=mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+                regression_datasets=regression_datasets,
+                regression_mu_floor=regression_mu_floor,
+                regression_lcb_floor=regression_lcb_floor,
+            )
+        elif eval_arr is not None and eval_indices is not None:
+            n = min(eval_n, len(eval_indices))
+            paired = paired_eval_adapter(
+                base_model, str(adapter), eval_arr, eval_indices[:n], "cuda:0",
+                batch_size=eval_batch_size,
+                n_bootstrap=bootstrap,
+                alpha=alpha,
+                acceptance_lcb_floor=acceptance_lcb_floor,
+                mean_delta_floor=mean_delta_floor,
+                hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                prepare_quasar_model=_prepare_quasar_model,
+            )
+
+        entry = {
+            "phase": "micro_screen",
+            "config": (
+                f"r{cfg.lora_r}:a{cfg.lora_alpha}:lr{cfg.lr:g}"
+                + (f":d{cfg.lora_dropout:g}" if cfg.lora_dropout is not None else "")
+            ),
+            "label": cfg.label,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "lr": cfg.lr,
+            "lora_dropout": cfg.lora_dropout if cfg.lora_dropout is not None else args.lora_dropout,
+            "max_steps": max_steps,
+            "screen_eval_n": eval_n,
+            "mu_hat": paired.get("mixture_mu_hat", paired.get("mu_hat")) if paired else None,
+            "lcb": paired.get("mixture_lcb", paired.get("lcb")) if paired else None,
+            "accepted": paired.get("accepted") if paired else False,
+            "n_eval": paired.get("n_eval") if paired else 0,
+            "train_elapsed_s": round(train_elapsed, 1),
+            "adapter_dir": str(adapter),
+            "gpu_memory": gpu_memory_stats(),
+        }
+        screen_result_path.write_text(json.dumps(entry, indent=2, default=str))
+        if paired is not None:
+            (cfg_out / "paired_eval_screen.json").write_text(
+                json.dumps(paired, indent=2, default=str),
+            )
+        results.append(entry)
+        log.info(
+            "micro-screen %s: mu_hat=%s lcb=%s (train %.1fs)",
+            cfg.label, entry["mu_hat"], entry["lcb"], train_elapsed,
+        )
+
+    ranked = sorted(results, key=_sweep_rank_key, reverse=True)
+    report = {
+        "phase": "micro_screen",
+        "max_steps": max_steps,
+        "screen_eval_n": eval_n,
+        "results": ranked,
+        "best": ranked[0]["label"] if ranked else None,
+        "best_mu_hat": ranked[0].get("mu_hat") if ranked else None,
+        "best_lcb": ranked[0].get("lcb") if ranked else None,
+    }
+    (screen_out / "micro_screen_results.json").write_text(json.dumps(report, indent=2))
+    log.info(
+        "micro-screen ranking (best first): %s",
+        [(r["label"], r.get("mu_hat"), r.get("lcb")) for r in ranked],
+    )
+    return ranked
 
 
 def run_lora_sweep(
@@ -1118,52 +1363,73 @@ def run_lora_sweep(
         if cfg.epochs is not None:
             cfg_args.epochs = cfg.epochs
 
+        summary_path = cfg_out / "train_summary.json"
+        adapter = cfg_out / "best_adapter"
+        if not adapter.exists():
+            if (cfg_out / "adapter_model.safetensors").exists() or \
+               (cfg_out / "adapter_model.bin").exists():
+                adapter = cfg_out
+        paired_mix_path = cfg_out / "paired_eval_mixture_adapter.json"
+        paired_fast_path = cfg_out / "paired_eval_adapter.json"
+        paired_cached = paired_mix_path if paired_mix_path.is_file() else (
+            paired_fast_path if paired_fast_path.is_file() else None
+        )
+        skip_training = summary_path.is_file() and adapter.exists()
+
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
         t0 = time.time()
-        adapter = run_lora_training(
-            base_model, train_p, val_p, cfg_out,
-            n_gpus, cfg_args, bundle,
-        )
-        elapsed = time.time() - t0
+        if skip_training:
+            log.info("sweep %s: reusing completed training (%s)", cfg.label, adapter)
+            elapsed = 0.0
+        else:
+            adapter = run_lora_training(
+                base_model, train_p, val_p, cfg_out,
+                n_gpus, cfg_args, bundle,
+            )
+            elapsed = time.time() - t0
 
         train_summary: dict = {}
-        summary_path = cfg_out / "train_summary.json"
         if summary_path.is_file():
             train_summary = json.loads(summary_path.read_text())
 
         paired: dict | None = None
-        if mixture_eval_pools and mixture_weights:
-            paired = mixture_weighted_paired_eval_adapter(
-                base_model, str(adapter), mixture_eval_pools, mixture_weights, "cuda:0",
-                batch_size=eval_batch_size,
-                n_bootstrap=bootstrap,
-                alpha=alpha,
-                acceptance_lcb_floor=acceptance_lcb_floor,
-                mean_delta_floor=mean_delta_floor,
-                hf_remote_code_kwargs=_hf_remote_code_kwargs,
-                prepare_quasar_model=_prepare_quasar_model,
-                regression_datasets=regression_datasets,
-                regression_mu_floor=regression_mu_floor,
-                regression_lcb_floor=regression_lcb_floor,
-            )
-            paired_path = cfg_out / "paired_eval_mixture_adapter.json"
-            paired_path.write_text(json.dumps(paired, indent=2, default=str))
-        elif eval_arr is not None and eval_indices is not None:
-            n_eval = min(fast_eval_n, len(eval_indices))
-            paired = paired_eval_adapter(
-                base_model, str(adapter), eval_arr, eval_indices[:n_eval], "cuda:0",
-                batch_size=eval_batch_size,
-                n_bootstrap=bootstrap,
-                alpha=alpha,
-                acceptance_lcb_floor=acceptance_lcb_floor,
-                mean_delta_floor=mean_delta_floor,
-                hf_remote_code_kwargs=_hf_remote_code_kwargs,
-                prepare_quasar_model=_prepare_quasar_model,
-            )
-            paired_path = cfg_out / "paired_eval_adapter.json"
-            paired_path.write_text(json.dumps(paired, indent=2))
+        if paired_cached is not None:
+            log.info("sweep %s: reusing paired eval %s", cfg.label, paired_cached.name)
+            paired = json.loads(paired_cached.read_text())
+        else:
+            release_gpu_memory()
+            if mixture_eval_pools and mixture_weights:
+                paired = mixture_weighted_paired_eval_adapter(
+                    base_model, str(adapter), mixture_eval_pools, mixture_weights, "cuda:0",
+                    batch_size=eval_batch_size,
+                    n_bootstrap=bootstrap,
+                    alpha=alpha,
+                    acceptance_lcb_floor=acceptance_lcb_floor,
+                    mean_delta_floor=mean_delta_floor,
+                    hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                    prepare_quasar_model=_prepare_quasar_model,
+                    regression_datasets=regression_datasets,
+                    regression_mu_floor=regression_mu_floor,
+                    regression_lcb_floor=regression_lcb_floor,
+                )
+                paired_path = cfg_out / "paired_eval_mixture_adapter.json"
+                paired_path.write_text(json.dumps(paired, indent=2, default=str))
+            elif eval_arr is not None and eval_indices is not None:
+                n_eval = min(fast_eval_n, len(eval_indices))
+                paired = paired_eval_adapter(
+                    base_model, str(adapter), eval_arr, eval_indices[:n_eval], "cuda:0",
+                    batch_size=eval_batch_size,
+                    n_bootstrap=bootstrap,
+                    alpha=alpha,
+                    acceptance_lcb_floor=acceptance_lcb_floor,
+                    mean_delta_floor=mean_delta_floor,
+                    hf_remote_code_kwargs=_hf_remote_code_kwargs,
+                    prepare_quasar_model=_prepare_quasar_model,
+                )
+                paired_path = cfg_out / "paired_eval_adapter.json"
+                paired_path.write_text(json.dumps(paired, indent=2))
 
         entry = {
             "config": (
@@ -1388,8 +1654,8 @@ def _rank_candidates(verdicts: list[dict]) -> dict | None:
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # Work / bundle
-    ap.add_argument("--work", default="/root/teutonic-mining/work")
-    ap.add_argument("--bundle", default="/root/teutonic-mining/bundle")
+    ap.add_argument("--work", default="/root/teutonic/s1-work")
+    ap.add_argument("--bundle", default="/root/teutonic/scripts/training_bundle")
 
     # Dataset
     ap.add_argument(
@@ -1443,7 +1709,15 @@ def main():
     )
     ap.add_argument(
         "--mix-shard-cache", default="",
-        help="Cache dir for mixed-mode shard downloads (default: <work>/mix_cache)",
+        help="Shard cache root (default: <work>/cache). Layout: "
+             "<cache>/manifests/<dataset>/ and <cache>/shards/<dataset>/",
+    )
+    ap.add_argument(
+        "--local-shards-only", action="store_true",
+        default=os.environ.get("TEUTONIC_LOCAL_SHARDS_ONLY", "").lower()
+        in ("1", "true", "yes"),
+        help="Use only shards already in --mix-shard-cache; never download "
+             "(env: TEUTONIC_LOCAL_SHARDS_ONLY=1)",
     )
     ap.add_argument(
         "--mix-shards-per-dataset", type=int, default=12,
@@ -1486,6 +1760,10 @@ def main():
     ap.add_argument("--val-size", type=int, default=None,
                     help="Validation sequences. Default from preset or 400.")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--score-log-every", type=int, default=10,
+        help="Log king scoring progress every N batches (also logs at least every 60s)",
+    )
 
     # Score cache
     ap.add_argument("--use-local-score-cache", action="store_true", default=True)
@@ -1502,8 +1780,8 @@ def main():
 
     # Fast / probe / strong modes and LoRA sweep
     ap.add_argument(
-        "--mode", choices=("fast", "probe", "strong"), default="",
-        help="Preset mode: fast, probe (cheap beatability check), or strong (A100 run).",
+        "--mode", choices=("fast", "probe", "micro", "strong"), default="",
+        help="Preset mode: fast, probe, micro (hyperparam screen), or strong (A100 run).",
     )
     ap.add_argument(
         "--lora-sweep", action="append", default=[],
@@ -1535,6 +1813,29 @@ def main():
         "--dual-eval", action="store_true",
         help="Run mixture local eval as primary verdict, then validator-style eval.",
     )
+
+    # Micro-screen: quick train + subsampled μ̂ to rank configs before full sweep
+    ap.add_argument(
+        "--micro-screen", action="store_true",
+        help="Two-phase sweep: short train + quick paired eval on all configs, "
+             "then full train only top-k (see --micro-screen-top-k).",
+    )
+    ap.add_argument(
+        "--micro-screen-only", action="store_true",
+        help="Run micro-screen ranking only; skip full confirm training.",
+    )
+    ap.add_argument("--micro-screen-max-steps", type=int, default=50,
+                    help="Optimizer steps per config during micro-screen (default 50).")
+    ap.add_argument("--micro-screen-eval-n", type=int, default=256,
+                    help="Total paired-eval sequences during micro-screen.")
+    ap.add_argument("--micro-screen-bootstrap", type=int, default=1000,
+                    help="Bootstrap samples for micro-screen LCB (default 1000).")
+    ap.add_argument("--micro-screen-top-k", type=int, default=1,
+                    help="How many top screen configs get full training (default 1).")
+    ap.add_argument("--micro-screen-min-mu", type=float, default=-999.0,
+                    help="Only confirm configs with screen mu_hat >= this (default: any).")
+    ap.add_argument("--force-micro-rescreen", action="store_true",
+                    help="Re-run micro-screen even if screen_result.json exists.")
 
     # Pre-submit gate
     ap.add_argument("--preferred-lcb-margin", type=float, default=0.0035)
@@ -1670,6 +1971,8 @@ def main():
 
     # --- apply --mode preset (explicit CLI args override via None defaults) ---
     mode_preset = MODE_PRESETS.get(args.mode, {}) if args.mode else {}
+    if args.mode == "micro" and not any(a.startswith("--micro-screen") for a in sys.argv):
+        args.micro_screen = True
     for key, value in mode_preset.items():
         if key == "lora_sweep":
             if not args.lora_sweep:
@@ -1856,7 +2159,7 @@ def main():
 
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
-    cache = work / "cache"
+    cache = Path(args.mix_shard_cache) if args.mix_shard_cache else work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
 
     if use_mixture:
@@ -1869,6 +2172,7 @@ def main():
             dataset_names=dataset_names,
             mix_json_path=mix_json,
             bucket_mix_overrides=bucket_mix_overrides or None,
+            local_shards_only=args.local_shards_only,
         )
         mixture_store = MixtureShardStore(mixture_cfg)
         log.info(
@@ -1877,6 +2181,16 @@ def main():
             len(mixture_cfg.sources),
             ", ".join(f"{n}={w:.2f}" for n, w in mixture_cfg.weights.items()),
         )
+        if args.local_shards_only:
+            for source in mixture_cfg.sources:
+                n_cached = sum(
+                    1 for key, _ in mixture_store._shard_meta[source.name]
+                    if is_shard_cached(source, key)
+                )
+                log.info(
+                    "local-shards-only: %s has %d cached shard(s) in %s",
+                    source.name, n_cached, source.shard_cache_dir,
+                )
 
     sweep_configs: list[LoRASweepConfig] = []
     if args.lora_sweep:
@@ -1956,6 +2270,7 @@ def main():
             }, indent=2))
             log.info("king cached by digest: %s", king_dir)
 
+    ensure_king_tokenizer_files(str(king_dir))
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
     if args.eval_mode == "validator":
@@ -2276,6 +2591,7 @@ def main():
                     force_rescore=args.force_rescore,
                     max_suspicious_frac=args.max_suspicious_frac,
                     use_score_cache=args.use_local_score_cache,
+                    score_log_every=args.score_log_every,
                 )
             else:
                 preset_cands: list[tuple[int, int]] | None = None
@@ -2311,6 +2627,7 @@ def main():
                     force_rescore=args.force_rescore,
                     king_hash=king_hash,
                     preset_cands=preset_cands,
+                    score_log_every=args.score_log_every,
                 )
             curriculum_path = iter_work / "curriculum.json"
             if curriculum_path.is_file():
@@ -2353,8 +2670,90 @@ def main():
                         chain_lr, args.lr, args.chain_lr_ratio,
                     )
             if sweep_configs and not merge_only:
+                confirm_configs = list(sweep_configs)
+                if args.micro_screen:
+                    screen_dir = iter_work / "micro_screen"
+                    screen_ranked = run_micro_screen_sweep(
+                        str(king_dir), train_p, val_p, screen_dir, sweep_configs,
+                        args.n_gpus, args, Path(args.bundle),
+                        eval_arr=eval_arr,
+                        eval_indices=eval_indices,
+                        eval_batch_size=args.eval_batch_size,
+                        bootstrap=args.micro_screen_bootstrap,
+                        alpha=args.alpha,
+                        acceptance_lcb_floor=args.acceptance_lcb_floor,
+                        mean_delta_floor=args.mean_delta_floor,
+                        fast_eval_n=args.fast_eval_n or 512,
+                        mixture_eval_pools=mixture_eval_pools,
+                        mixture_weights=mixture_cfg.weights if mixture_cfg else None,
+                        regression_datasets=regression_datasets,
+                        regression_mu_floor=args.regression_mu_floor,
+                        regression_lcb_floor=args.regression_lcb_floor,
+                        max_steps=args.micro_screen_max_steps,
+                        eval_n=args.micro_screen_eval_n,
+                        force_rescreen=args.force_micro_rescreen,
+                    )
+                    if args.micro_screen_only:
+                        best_screen = screen_ranked[0] if screen_ranked else {}
+                        log.info(
+                            "micro-screen-only done: best=%s mu_hat=%s lcb=%s",
+                            best_screen.get("label"),
+                            best_screen.get("mu_hat"),
+                            best_screen.get("lcb"),
+                        )
+                        (iter_work / "micro_screen_summary.json").write_text(
+                            json.dumps(
+                                {
+                                    "best": best_screen,
+                                    "ranking": screen_ranked,
+                                },
+                                indent=2,
+                                default=str,
+                            ),
+                        )
+                        if it == args.max_iters - 1:
+                            raise SystemExit(
+                                0 if float(best_screen.get("mu_hat") or -999) > 0 else 2
+                            )
+                        continue
+                    confirm_configs = []
+                    for entry in screen_ranked:
+                        if len(confirm_configs) >= args.micro_screen_top_k:
+                            break
+                        mu = float(entry.get("mu_hat") or -999)
+                        if mu < args.micro_screen_min_mu:
+                            continue
+                        match = next(
+                            (c for c in sweep_configs if c.label == entry["label"]),
+                            None,
+                        )
+                        if match is not None:
+                            confirm_configs.append(match)
+                    if not confirm_configs:
+                        msg = (
+                            f"micro-screen: no config passed min_mu={args.micro_screen_min_mu:g}. "
+                            f"Best screen mu_hat={screen_ranked[0].get('mu_hat') if screen_ranked else None}. "
+                            "Try more sweep specs, lower --micro-screen-min-mu, or more data."
+                        )
+                        log.error(msg)
+                        (iter_work / "micro_screen_abort.json").write_text(
+                            json.dumps(
+                                {
+                                    "abort_reason": msg,
+                                    "ranking": screen_ranked,
+                                },
+                                indent=2,
+                                default=str,
+                            ),
+                        )
+                        raise SystemExit(2)
+                    log.info(
+                        "micro-screen confirm: full training %d config(s): %s",
+                        len(confirm_configs),
+                        [c.label for c in confirm_configs],
+                    )
                 best_cfg, adapter, sweep_results = run_lora_sweep(
-                    str(king_dir), train_p, val_p, sweep_out, sweep_configs,
+                    str(king_dir), train_p, val_p, sweep_out, confirm_configs,
                     args.n_gpus, args, Path(args.bundle),
                     eval_arr=eval_arr,
                     eval_indices=eval_indices,

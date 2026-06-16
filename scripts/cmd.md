@@ -18,7 +18,7 @@ hippius-hub download teutonic/teutonic-q3-4b-genesis <filename> --revision main
 5Ev4MnNC
 5ev4mnnc
 
-hippius-hub upload yoko/teutonic-5ev4mnnc-012 /root/teutonic/s1-work/iter_00/merged --revision main
+hippius-hub upload yoko/teutonic-5ev4mnnc-013 /root/teutonic/s1-work-search/iter_00/merged --revision main
 hf download silvanus0930/Teutonic-Q3-8B-Test /root/teutonic/s1-work/merged
 
 hf download "silvanus0930/Teutonic-Q3-8B-Test" --local-dir "/root/teutonic/s1-work/merged"
@@ -166,8 +166,8 @@ Skips ~18 min scoring and does **not** reload 4×2G shards.
 hippius-hub upload yoko/teutonic-5ev4mnnc-013 /root/teutonic/s1-work/merged1 --revision main
 
 python scripts/mining/submit_challenger.py \
-  --uploaded-repo yoko/teutonic-5ev4mnnc-013 \
-  --uploaded-digest sha256:d46b852f45124435589d293d6097b9d9167e8bc47c288d118bc80fd04574941d \
+  --uploaded-repo yoko/teutonic-5ev4mnnc-014 \
+  --uploaded-digest sha256:bb68cf053a67f769dd2402f2a2c31b1a5a8c127e423c26061d85ee756eb89702 \
   --wallet-name silvanus-hs1 \
   --hotkey hotkey41 \
   --netuid 3 \
@@ -212,7 +212,7 @@ python scripts/mining/submit_external_model.py \
   --report-out /root/teutonic/s1-work/verdict.json
 
 
-export LOCAL_KING_DIR="/root/teutonic/s1-work/king2"
+export LOCAL_KING_DIR="/root/teutonic/s1-work/king1"
 export LOCAL_DATASET_MANIFEST="/root/teutonic/s1-work/dataset/manifest.json"
 export TEUTONIC_SIM_HOTKEY="5FhMoUmcE9ed4p1it7xebF1y1SHdC5hYFbD1Gk44wuiX88hv"
 export TRANSFORMERS_TRUST_REMOTE_CODE=true
@@ -278,3 +278,27 @@ python -u scripts/mining/train_challenger.py \
   python scripts/mining/reshard_merged.py \
   --in /root/.cache/hippius/hub/models--mastertensor--teutonic-q3-10b-5ek5koe5-57645162954-rn/snapshots/5Ek5KoE5-57645162954-rn \
   --out /root/teutonic/s1-work/merged1
+
+export LOCAL_KING_DIR=/root/teutonic/s1-work/king2
+  
+python scripts/mining/train_challenger.py \
+  --work /root/teutonic/s1-work \
+  --bundle scripts/training_bundle \
+  --mode strong \
+  --mix-shards-per-dataset 12 \
+  --profile a100-80gb \
+  --sim-hotkey "$TEUTONIC_SIM_HOTKEY" \
+  --skip-chain-check
+
+  python -u scripts/mining/train_challenger.py \
+  --work /root/teutonic/s1-work-probe \
+  --bundle scripts/training_bundle \
+  --mode probe \
+  --profile a100-80gb \
+  --mix-shard-cache /root/teutonic/s1-work/cache \
+  --local-shards-only \
+  --mix-shards-per-dataset 12 \
+  --score-log-every 5 \
+  --skip-scoring \
+  --sim-hotkey "$TEUTONIC_SIM_HOTKEY" \
+  --report-out /root/teutonic/s1-work-probe/verdict.json

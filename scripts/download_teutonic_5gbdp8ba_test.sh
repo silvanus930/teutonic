@@ -8,12 +8,13 @@
 #
 # Optional:
 #   OUT_DIR=/data/models/teutonic-test ./scripts/download_teutonic_5gbdp8ba_test.sh
+#   WORK_DIR=/root/teutonic/s1-work ./scripts/download_teutonic_5gbdp8ba_test.sh
 
 set -euo pipefail
 
-REPO="mastertensor/teutonic-q3-10b-5ek5koe5-41021132322-rn"
-REV="5Ek5KoE5-41021132322-rn"
-OUT_DIR="${OUT_DIR:-/root/teutonic/s1-work/king1}"
+REPO="whiskey/teutonic-5dawwwmr-4077716652-cp4"
+REV="5DaWwWmR-4077716652"
+OUT_DIR="${OUT_DIR:-/root/teutonic/s1-work/king2}"
 
 FILES=(
   model-00001-of-00004.safetensors
@@ -25,6 +26,8 @@ FILES=(
   configuration_qwen3_5.py
   config.json
   generation_config.json
+  tokenizer.json
+  tokenizer_config.json
 )
 
 if ! command -v hippius-hub >/dev/null 2>&1; then
@@ -37,7 +40,6 @@ cd "$OUT_DIR"
 
 echo "[download] repo=${REPO} revision=${REV}"
 echo "[download] output=${OUT_DIR}"
-echo "[download] ~32 GB total (9 weight shards)"
 echo
 
 for f in "${FILES[@]}"; do
@@ -52,3 +54,26 @@ done
 echo
 echo "[done] files in ${OUT_DIR}:"
 ls -lh
+
+# Hippius kings often omit tokenizer files — copy from sibling or TEUTONIC_TOKENIZER_DIR
+if [[ ! -f "${OUT_DIR}/tokenizer.json" ]]; then
+  TOK_SRC="${TEUTONIC_TOKENIZER_DIR:-}"
+  if [[ -z "${TOK_SRC}" && -f "$(dirname "${OUT_DIR}")/king1/tokenizer.json" ]]; then
+    TOK_SRC="$(dirname "${OUT_DIR}")/king1"
+  fi
+  if [[ -n "${TOK_SRC}" && -f "${TOK_SRC}/tokenizer.json" ]]; then
+    echo "[copy] tokenizer from ${TOK_SRC}"
+    cp -av "${TOK_SRC}/tokenizer.json" "${TOK_SRC}/tokenizer_config.json" "${OUT_DIR}/" 2>/dev/null || \
+      cp -av "${TOK_SRC}/tokenizer.json" "${OUT_DIR}/"
+  else
+    echo "[warn] no tokenizer.json in ${OUT_DIR}; set TEUTONIC_TOKENIZER_DIR or copy from king1 before training"
+  fi
+fi
+
+CACHE_SNAPSHOT="${HOME}/.cache/hippius/hub/models--${REPO//\//--}/snapshots/${REV}"
+WORK_DIR="${WORK_DIR:-/root/teutonic/s1-work}"
+
+echo
+echo "[copy] ${CACHE_SNAPSHOT} -> ${WORK_DIR}"
+mkdir -p "$WORK_DIR"
+cp -avL "$CACHE_SNAPSHOT" "$WORK_DIR"
