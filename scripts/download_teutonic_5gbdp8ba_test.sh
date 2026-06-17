@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-REPO="whiskey/teutonic-5dawwwmr-4077716652-cp4"
-REV="5DaWwWmR-4077716652"
-OUT_DIR="${OUT_DIR:-/root/teutonic/s1-work/king2}"
+REPO="whiskey/teutonic-5dawwwmr-7971731779-cp1"
+REV="5DaWwWmR-7971731779"
+OUT_DIR="${OUT_DIR:-/root/teutonic/s1-work/king1}"
 
 FILES=(
   model-00001-of-00004.safetensors
@@ -26,8 +26,6 @@ FILES=(
   configuration_qwen3_5.py
   config.json
   generation_config.json
-  tokenizer.json
-  tokenizer_config.json
 )
 
 if ! command -v hippius-hub >/dev/null 2>&1; then

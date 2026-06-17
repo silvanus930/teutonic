@@ -6,6 +6,7 @@ curriculum, and offline eval pools.
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -438,6 +439,23 @@ class MixtureShardStore:
     def refs_to_candidates(self, refs: list[SequenceRef]) -> list[tuple[int, int]]:
         self.ensure_loaded({r.shard_key for r in refs})
         return [(self.local_index(r.shard_key), r.row_idx) for r in refs]
+
+    def release_shards(self, shard_keys: set[str] | list[str]) -> int:
+        """Drop loaded shard arrays to cap RSS during multi-dataset scoring."""
+        nbytes = 0
+        n = 0
+        for key in shard_keys:
+            arr = self._arrays.pop(key, None)
+            if arr is not None:
+                nbytes += int(arr.nbytes)
+                n += 1
+        if n:
+            gc.collect()
+            log.info(
+                "released %d shard array(s), ~%.2f GiB RAM",
+                n, nbytes / (1024 ** 3),
+            )
+        return n
 
     def manifest_for(self, dataset_name: str) -> dict:
         return self._manifests[dataset_name]

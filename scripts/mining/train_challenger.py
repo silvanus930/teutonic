@@ -15,7 +15,8 @@ Pipeline:
   5. Build a curriculum (general / hard / easy buckets, drop suspicious).
        Fractions: --general-frac --hard-frac --easy-frac (default 60/30/10).
   6. Train LoRA adapter(s) with optional --lora-sweep (adapter eval before merge).
-       Modes: --mode {fast,probe,micro,strong} for preset sweeps.
+       Modes: --mode {fast,probe,micro,screen,strong} for preset sweeps.
+       --mode screen: score mixture + dataset_trainability.json (no LoRA train).
        --micro-screen: short train + quick μ̂ ranking, then full train top-k only.
   7. Merge only the best LoRA candidate after sweep.
   8. Offline paired eval candidate vs king on held-out shard slice
@@ -100,12 +101,19 @@ from dataset_mixture import (  # noqa: E402
     MixtureShardStore,
     build_mixture_allocations,
     build_mixture_config,
+    download_mixture_datasets,
     is_shard_cached,
     parse_bucket_mix_arg,
     parse_dataset_manifest_arg,
     parse_dataset_weight_arg,
     prepare_mixture_eval_pools,
     save_allocation_summary,
+)
+from dataset_screen import (  # noqa: E402
+    build_trainability_report,
+    format_next_train_cli,
+    shard_cache_stats_from_store,
+    write_trainability_report,
 )
 from paired_eval import (  # noqa: E402
     compute_per_seq_loss,
@@ -214,6 +222,17 @@ MODE_PRESETS: dict[str, dict] = {
         ],
         "abort_if_mu_hat_nonpositive": False,
         "max_iters": 1,
+    },
+    "screen": {
+        "dataset_preset": "teutonic-mixture-v2",
+        "eval_mode": "local",
+        "n_score": 5000,
+        "train_per_iter": 4000,
+        "val_size": 400,
+        "n_eval": 500,
+        "max_iters": 1,
+        "dataset_screen_only": True,
+        "prefetch_mix_shards": True,
     },
     "strong": {
         "dataset_preset": "teutonic-mixture-v2",
@@ -1024,7 +1043,7 @@ def score_and_curate_mixture(
     max_suspicious_frac: float = 0.0,
     use_score_cache: bool = True,
     score_log_every: int = 10,
-) -> tuple[Path, Path, dict]:
+) -> tuple[Path, Path, dict, dict]:
     """Score and build curriculum across weighted mixture datasets."""
     rows_by_dataset: dict[str, list[dict]] = {}
     shards_used: list[str] = []
@@ -1035,8 +1054,8 @@ def score_and_curate_mixture(
             continue
         ds_seed = seed + hash(source.name) % 100000
         refs = store.sample_refs(source.name, n_score, ds_seed, shards_per_dataset)
-        cands = store.refs_to_candidates(refs)
-        shards_used.extend(sorted({r.shard_key for r in refs}))
+        dataset_shard_keys = sorted({r.shard_key for r in refs})
+        shards_used.extend(dataset_shard_keys)
 
         cache_dir = None
         if use_score_cache:
@@ -1046,17 +1065,33 @@ def score_and_curate_mixture(
             cache_dir = store.score_cache_dir(work_root, king_hash, source.name)
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-        log.info("mixture scoring %s: n=%d candidates", source.name, len(cands))
-        rows = _score_dataset_candidates(
-            king_dir, store.arrays, store.keys, cands, device,
-            cache_dir, force_rescore,
-            score_log_every=score_log_every,
-            label=f"mixture scoring {source.name}",
-        )
+        cached_rows = None
+        if cache_dir and not force_rescore:
+            cached_rows = _load_score_cache(cache_dir, dataset_shard_keys)
+
+        if cached_rows is not None:
+            rows = cached_rows
+            for r in rows:
+                if "row_idx" in r and "idx" not in r:
+                    r["idx"] = r["row_idx"]
+            log.info(
+                "mixture scoring %s: n=%d candidates (score cache hit)",
+                source.name, len(rows),
+            )
+        else:
+            cands = store.refs_to_candidates(refs)
+            log.info("mixture scoring %s: n=%d candidates", source.name, len(cands))
+            rows = _score_dataset_candidates(
+                king_dir, store.arrays, store.keys, cands, device,
+                cache_dir, force_rescore,
+                score_log_every=score_log_every,
+                label=f"mixture scoring {source.name}",
+            )
         for r in rows:
             r["dataset"] = source.name
         assign_buckets(rows)
         rows_by_dataset[source.name] = rows
+        store.release_shards(set(dataset_shard_keys))
 
     train_rows, val_rows, curriculum_summary = build_mixture_curriculum(
         rows_by_dataset,
@@ -1069,7 +1104,7 @@ def score_and_curate_mixture(
 
     all_rows = [r for rows in rows_by_dataset.values() for r in rows]
     work.mkdir(parents=True, exist_ok=True)
-    train_p, val_p = write_curriculum_jsonl(train_rows, val_rows, work, store.arrays)
+    train_p, val_p = write_curriculum_jsonl(train_rows, val_rows, work, shards=None)
     save_curriculum_reports(
         work, all_rows, curriculum_summary,
         seed=seed,
@@ -1082,8 +1117,21 @@ def score_and_curate_mixture(
         "mixture curriculum: train=%d val=%d across %d datasets",
         len(train_rows), len(val_rows), len(rows_by_dataset),
     )
+
+    shard_stats = shard_cache_stats_from_store(store)
+    train_report = build_trainability_report(
+        rows_by_dataset,
+        allocations=allocations,
+        bucket_mix=cfg.bucket_mix,
+        shard_stats=shard_stats,
+    )
+    write_trainability_report(work, train_report)
+    (work / "next_train_hint.txt").write_text(
+        format_next_train_cli(work.parent if work.name.startswith("iter_") else work, train_report),
+    )
+
     release_gpu_memory()
-    return train_p, val_p, curriculum_summary
+    return train_p, val_p, curriculum_summary, train_report
 
 
 # ---------------------------------------------------------------------------
@@ -1780,8 +1828,8 @@ def main():
 
     # Fast / probe / strong modes and LoRA sweep
     ap.add_argument(
-        "--mode", choices=("fast", "probe", "micro", "strong"), default="",
-        help="Preset mode: fast, probe, micro (hyperparam screen), or strong (A100 run).",
+        "--mode", choices=("fast", "probe", "micro", "screen", "strong"), default="",
+        help="Preset mode: fast, probe, micro, screen (dataset trainability), strong.",
     )
     ap.add_argument(
         "--lora-sweep", action="append", default=[],
@@ -1836,6 +1884,22 @@ def main():
                     help="Only confirm configs with screen mu_hat >= this (default: any).")
     ap.add_argument("--force-micro-rescreen", action="store_true",
                     help="Re-run micro-screen even if screen_result.json exists.")
+
+    ap.add_argument(
+        "--dataset-screen-only", action="store_true",
+        help="After mixture scoring, write dataset_trainability.json and exit "
+             "(no LoRA training).",
+    )
+    ap.add_argument(
+        "--prefetch-mix-shards", action="store_true",
+        help="Download mixture shard pool before scoring/training "
+             "(ignored with --local-shards-only).",
+    )
+    ap.add_argument(
+        "--auto-bucket-mix", action="store_true",
+        help="If <work>/dataset_trainability.json exists, apply suggested "
+             "per-dataset bucket mix before scoring.",
+    )
 
     # Pre-submit gate
     ap.add_argument("--preferred-lcb-margin", type=float, default=0.0035)
@@ -1940,6 +2004,10 @@ def main():
                          "multiply base --lr by this ratio for follow-up iters.")
     ap.add_argument("--from-iter", type=int, default=-1)
     ap.add_argument("--skip-scoring", action="store_true")
+    ap.add_argument(
+        "--stop-after-scoring", action="store_true",
+        help="After score/curate, write train.jsonl/val.jsonl and exit (no LoRA training).",
+    )
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if verdict.json already exists for that iter")
 
@@ -1971,8 +2039,11 @@ def main():
 
     # --- apply --mode preset (explicit CLI args override via None defaults) ---
     mode_preset = MODE_PRESETS.get(args.mode, {}) if args.mode else {}
-    if args.mode == "micro" and not any(a.startswith("--micro-screen") for a in sys.argv):
-        args.micro_screen = True
+    if args.mode == "micro":
+        # --micro-screen-only must still enable micro-screen; do not treat it as
+        # an explicit opt-out of the micro_screen flag (prefix match bug).
+        if args.micro_screen_only or not any(a == "--micro-screen" for a in sys.argv):
+            args.micro_screen = True
     for key, value in mode_preset.items():
         if key == "lora_sweep":
             if not args.lora_sweep:
@@ -1988,6 +2059,16 @@ def main():
             a.startswith("--abort-if-mu-hat") for a in sys.argv
         ):
             args.abort_if_mu_hat_nonpositive = bool(value)
+            continue
+        if key == "dataset_screen_only" and not any(
+            a.startswith("--dataset-screen") for a in sys.argv
+        ):
+            args.dataset_screen_only = bool(value)
+            continue
+        if key == "prefetch_mix_shards" and not any(
+            a.startswith("--prefetch-mix") for a in sys.argv
+        ):
+            args.prefetch_mix_shards = bool(value)
             continue
         if key == "dataset_preset" and not args.dataset_preset:
             args.dataset_preset = str(value)
@@ -2143,6 +2224,20 @@ def main():
     mix_json = (
         args.dataset_mix or os.environ.get("TEUTONIC_DATASET_MIX", "")
     ).strip()
+
+    work = Path(args.work)
+    work.mkdir(parents=True, exist_ok=True)
+    trainability_path = work / "dataset_trainability.json"
+    if args.auto_bucket_mix and trainability_path.is_file() and not args.bucket_mix:
+        prior = json.loads(trainability_path.read_text())
+        for ds in prior.get("datasets", []):
+            sm = ds.get("suggested_bucket_mix", {})
+            if sm:
+                bucket_mix_overrides[ds["dataset"]] = (
+                    float(sm["general"]), float(sm["hard"]), float(sm["easy"]),
+                )
+        log.info("auto-bucket-mix: loaded suggestions from %s", trainability_path)
+
     use_mixture = (
         args.dataset_preset == "teutonic-mixture-v2"
         or bool(mix_json)
@@ -2157,8 +2252,6 @@ def main():
     mixture_allocations: dict | None = None
     mixture_eval_pools: dict[str, tuple[np.ndarray, list[int]]] | None = None
 
-    work = Path(args.work)
-    work.mkdir(parents=True, exist_ok=True)
     cache = Path(args.mix_shard_cache) if args.mix_shard_cache else work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -2181,6 +2274,27 @@ def main():
             len(mixture_cfg.sources),
             ", ".join(f"{n}={w:.2f}" for n, w in mixture_cfg.weights.items()),
         )
+        if args.prefetch_mix_shards and not args.local_shards_only:
+            log.info(
+                "prefetch-mix-shards: downloading up to %d shard(s)/dataset",
+                args.mix_shards_per_dataset,
+            )
+            dl_report = download_mixture_datasets(
+                mixture_cfg,
+                shards_per_dataset=args.mix_shards_per_dataset,
+                seed=args.seed,
+                workers=4,
+            )
+            (work / "shard_prefetch.json").write_text(
+                json.dumps(dl_report, indent=2, default=str),
+            )
+            log.info(
+                "prefetch done: downloaded=%s cached=%s failed=%s",
+                dl_report.get("summary", {}).get("shards_downloaded"),
+                dl_report.get("summary", {}).get("shards_cached"),
+                dl_report.get("summary", {}).get("shards_failed"),
+            )
+            mixture_store = MixtureShardStore(mixture_cfg)
         if args.local_shards_only:
             for source in mixture_cfg.sources:
                 n_cached = sum(
@@ -2584,7 +2698,7 @@ def main():
                     shards, args.train_per_iter, args.val_size, seed, iter_work,
                 )
             elif use_mixture and mixture_store and mixture_cfg and mixture_allocations:
-                train_p, val_p, curriculum_stats = score_and_curate_mixture(
+                train_p, val_p, curriculum_stats, train_report = score_and_curate_mixture(
                     str(king_dir), mixture_store, mixture_cfg, mixture_allocations,
                     seed, "cuda:0", iter_work, king_hash,
                     shards_per_dataset=args.mix_shards_per_dataset,
@@ -2593,6 +2707,19 @@ def main():
                     use_score_cache=args.use_local_score_cache,
                     score_log_every=args.score_log_every,
                 )
+                shutil.copy2(
+                    iter_work / "dataset_trainability.json",
+                    work / "dataset_trainability.json",
+                )
+                hint_src = iter_work / "next_train_hint.txt"
+                if hint_src.is_file():
+                    shutil.copy2(hint_src, work / "next_train_hint.txt")
+                if args.dataset_screen_only:
+                    log.info(
+                        "dataset-screen-only: report at %s — see next_train_hint.txt",
+                        work / "dataset_trainability.json",
+                    )
+                    raise SystemExit(0)
             else:
                 preset_cands: list[tuple[int, int]] | None = None
                 iter_shards = shards
@@ -2632,6 +2759,13 @@ def main():
             curriculum_path = iter_work / "curriculum.json"
             if curriculum_path.is_file():
                 curriculum_stats = json.loads(curriculum_path.read_text())
+
+        if args.stop_after_scoring:
+            log.info(
+                "stop-after-scoring: curriculum at %s (train=%s val=%s)",
+                iter_work, train_p, val_p,
+            )
+            raise SystemExit(0)
 
         # --- Train ---
         sweep_out = iter_work / "lora_sweep"
